@@ -1,11 +1,3 @@
-// GTK 4.10 deprecated TreeView/TreeStore in favor of ColumnView +
-// TreeListModel + factories. Migrating is a larger undertaking — both
-// require defining a `glib::Object` subclass for entries — so we
-// deliberately stick with the classic API for this iteration and silence
-// the deprecation lints rather than letting them drown out real warnings.
-// Switching to ColumnView + factories is tracked in SESSION.md.
-#![allow(deprecated)]
-
 //! # Diskalyzer GUI
 //!
 //! GTK4 front-end for the `diskalyzer` library. The window appears
@@ -21,26 +13,41 @@
 //! nix develop
 //! cargo run --features gui --bin diskalyzer-gui -- ~/dev
 //! ```
+//!
+//! ## Architecture
+//!
+//! The view is a `gtk::ColumnView` driven by a `gtk::TreeListModel` whose
+//! root is a `gio::ListStore` of [`EntryItem`] objects. Per-cell rendering
+//! is done with `gtk::SignalListItemFactory` instances, one per column.
+//! This is the modern (GTK 4.10+) replacement for the `TreeView` /
+//! `TreeStore` / `CellRenderer*` stack, which is deprecated.
+//!
+//! Lazy population is wired via the `TreeListModel`'s create-children
+//! closure plus a per-row `notify::expanded` signal: the closure registers
+//! an empty child store eagerly (so the expander triangle appears) but
+//! the worker thread that fills it is only dispatched once the user
+//! actually expands the row.
 
-use std::cell::Cell;
-use std::collections::HashSet;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
-use async_channel::{unbounded, Sender};
+use async_channel::{Sender, unbounded};
 use gtk::gio;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::{
-    Application, ApplicationWindow, CellRendererText, HeaderBar, Label,
-    Orientation, ScrolledWindow, TreeIter, TreeStore, TreeView, TreeViewColumn,
+    Application, ApplicationWindow, ColumnView, ColumnViewColumn, HeaderBar, Label, ListItem,
+    NoSelection, Orientation, ScrolledWindow, SignalListItemFactory, SortListModel, TreeExpander,
+    TreeListModel, TreeListRow, TreeListRowSorter,
 };
 
-use diskalyzer::{enumerate_children, subtree_size, AnalyzeOptions, Entry};
+use diskalyzer::{AnalyzeOptions, Entry, enumerate_children, subtree_size};
 
 // ==============================================================================
-// Custom bar cell renderer
+// Color palette
 // ==============================================================================
 
 /// Per-depth color palette for the share bar. Cycles through these so
@@ -78,15 +85,20 @@ fn contrasting_text_rgba(bg: &gtk::gdk::RGBA) -> gtk::gdk::RGBA {
     }
 }
 
-/// `gtk::CellRenderer` subclass that paints a single colored bar.
-///
-/// We can't use the stock `CellRendererProgress` here because its fill
-/// color is owned by the GTK theme — there's no per-cell hook to override
-/// it — and we want each tree depth in its own color. Compositing the
-/// bar from unicode block glyphs (the previous attempt) leaves visible
-/// hairlines between cells under most fonts; drawing a single filled
-/// rectangle via `gtk::Snapshot::append_color` produces a seamless block.
-mod bar_renderer {
+// ==============================================================================
+// Custom widget: depth-colored share bar
+// ==============================================================================
+//
+// We can't use a stock progress bar widget here because its fill color is
+// owned by the GTK theme — there's no per-cell hook to override it — and
+// we want each tree depth in its own color. A custom `gtk::Widget`
+// subclass that paints a single filled rectangle via
+// `gtk::Snapshot::append_color` produces a seamless block, and lets us
+// expose `percent` and `depth` as glib properties so the column factory
+// can `bind_property` them onto the row's `EntryItem`.
+
+mod depth_bar {
+    use super::{contrasting_text_rgba, palette_rgba};
     use std::cell::Cell;
 
     use gtk::glib;
@@ -96,14 +108,14 @@ mod bar_renderer {
     use gtk::subclass::prelude::*;
     use gtk::{gdk, graphene};
 
-    /// Width of the inner bar that we draw, capped to keep the bar from
-    /// overpowering the row at very tall row heights.
-    const BAR_HEIGHT_PX: f32 = 14.0;
-    const HORIZONTAL_PADDING_PX: f32 = 2.0;
+    /// Width of the inner bar, capped to keep the bar from overpowering
+    /// the row at very tall row heights.
+    pub const BAR_HEIGHT_PX: f32 = 14.0;
+    pub const HORIZONTAL_PADDING_PX: f32 = 2.0;
 
     #[derive(Default, Properties)]
-    #[properties(wrapper_type = super::DepthBarRenderer)]
-    pub struct DepthBarRenderer {
+    #[properties(wrapper_type = super::DepthBar)]
+    pub struct DepthBar {
         /// Fill percentage in the range 0..=100. Anything outside is
         /// clamped at draw time, so a malformed model won't crash the
         /// renderer.
@@ -115,50 +127,65 @@ mod bar_renderer {
     }
 
     #[glib::object_subclass]
-    impl ObjectSubclass for DepthBarRenderer {
-        const NAME: &'static str = "DiskalyzerDepthBarRenderer";
-        type Type = super::DepthBarRenderer;
-        type ParentType = gtk::CellRenderer;
+    impl ObjectSubclass for DepthBar {
+        const NAME: &'static str = "DiskalyzerDepthBar";
+        type Type = super::DepthBar;
+        type ParentType = gtk::Widget;
     }
 
     #[glib::derived_properties]
-    impl ObjectImpl for DepthBarRenderer {}
-
-    impl CellRendererImpl for DepthBarRenderer {
-        fn preferred_width<P: IsA<gtk::Widget>>(&self, _widget: &P) -> (i32, i32) {
-            // Min keeps the column from collapsing past the point where
-            // the bar is meaningful; nat is what gtk uses when the column
-            // is `expand`ed.
-            (60, 240)
+    impl ObjectImpl for DepthBar {
+        fn constructed(&self) {
+            self.parent_constructed();
+            // Property changes don't trigger a redraw automatically — we
+            // wire it up here so updates from `bind_property` repaint.
+            let obj = self.obj();
+            obj.connect_notify_local(Some("percent"), |w, _| w.queue_draw());
+            obj.connect_notify_local(Some("depth"), |w, _| w.queue_draw());
         }
+    }
 
-        fn preferred_height<P: IsA<gtk::Widget>>(&self, _widget: &P) -> (i32, i32) {
-            (BAR_HEIGHT_PX as i32 + 4, BAR_HEIGHT_PX as i32 + 4)
-        }
-
-        fn snapshot<P: IsA<gtk::Widget>>(
+    impl WidgetImpl for DepthBar {
+        fn measure(
             &self,
-            snapshot: &gtk::Snapshot,
-            widget: &P,
-            _background_area: &gdk::Rectangle,
-            cell_area: &gdk::Rectangle,
-            _flags: gtk::CellRendererState,
-        ) {
+            orientation: gtk::Orientation,
+            _for_size: i32,
+        ) -> (i32, i32, i32, i32) {
+            // Min width keeps the column from collapsing past the point
+            // where the bar is meaningful; nat width is what the layout
+            // hands us when the column gets surplus space.
+            match orientation {
+                gtk::Orientation::Horizontal => (60, 240, -1, -1),
+                gtk::Orientation::Vertical => (
+                    BAR_HEIGHT_PX as i32 + 4,
+                    BAR_HEIGHT_PX as i32 + 4,
+                    -1,
+                    -1,
+                ),
+                _ => (0, 0, -1, -1),
+            }
+        }
+
+        fn snapshot(&self, snapshot: &gtk::Snapshot) {
+            let widget = self.obj();
             let percent_i = self.percent.get().clamp(0, 100);
             let percent = percent_i as f32;
             let depth = self.depth.get();
-            let fill_color = super::palette_rgba(depth);
+            let fill_color = palette_rgba(depth);
 
-            let cell_w = cell_area.width() as f32;
-            let cell_h = cell_area.height() as f32;
+            // Custom widgets get a 0,0-anchored coordinate system, so we
+            // don't have to translate by the cell-area's offset like the
+            // old CellRenderer did.
+            let cell_w = widget.width() as f32;
+            let cell_h = widget.height() as f32;
             let bar_h = (cell_h - 2.0 * HORIZONTAL_PADDING_PX).min(BAR_HEIGHT_PX);
-            let y = cell_area.y() as f32 + (cell_h - bar_h) / 2.0;
-            let x = cell_area.x() as f32 + HORIZONTAL_PADDING_PX;
+            let y = (cell_h - bar_h) / 2.0;
+            let x = HORIZONTAL_PADDING_PX;
             let w_total = cell_w - 2.0 * HORIZONTAL_PADDING_PX;
             let w_filled = w_total * percent / 100.0;
 
             // ----- Bar -----
-
+            //
             // Track: subtle gray that respects both light and dark
             // themes by virtue of low alpha — it tints the row's
             // background rather than fighting it.
@@ -175,33 +202,31 @@ mod bar_renderer {
 
             // ----- Percent text -----
             //
-            // We draw the text *twice* — once clipped to the filled
-            // portion, once clipped to the unfilled portion — so the
-            // characters that sit on top of the colored fill use the
-            // contrast-chosen foreground while the characters that sit
-            // over the muted track use the theme's normal foreground.
-            // Without this two-pass clipping we'd have to pick a single
-            // color that compromises on either side.
-
+            // Drawn *twice* — once clipped to the filled portion, once
+            // clipped to the unfilled portion — so the characters that
+            // sit on top of the colored fill use the contrast-chosen
+            // foreground while the characters that sit over the muted
+            // track use the theme's normal foreground. Without this
+            // two-pass clipping we'd have to pick a single color that
+            // compromises on either side.
             let label = format!("{percent_i}%");
-            let layout = widget.as_ref().create_pango_layout(Some(&label));
+            let layout = widget.create_pango_layout(Some(&label));
             let (text_w, text_h) = layout.pixel_size();
             // Center the text horizontally within the bar's full width
-            // (not the filled portion) so its position is stable as
-            // the row's percent changes.
+            // (not the filled portion) so its position is stable as the
+            // row's percent changes.
             let text_x = x + (w_total - text_w as f32) / 2.0;
-            let text_y = cell_area.y() as f32 + (cell_h - text_h as f32) / 2.0;
+            let text_y = (cell_h - text_h as f32) / 2.0;
 
             let text_pt = graphene::Point::new(text_x, text_y);
-            let theme_fg = widget.as_ref().color();
-            let on_fill_fg = super::contrasting_text_rgba(&fill_color);
+            let theme_fg = widget.color();
+            let on_fill_fg = contrasting_text_rgba(&fill_color);
 
             // Pass 1: portion of text that lies over the empty track.
-            // Clip to the right of the fill.
             if w_filled < w_total {
                 let track_clip = graphene::Rect::new(
                     x + w_filled,
-                    cell_area.y() as f32,
+                    0.0,
                     w_total - w_filled,
                     cell_h,
                 );
@@ -215,7 +240,7 @@ mod bar_renderer {
 
             // Pass 2: portion of text that lies over the filled bar.
             if w_filled > 0.5 {
-                let fill_clip = graphene::Rect::new(x, cell_area.y() as f32, w_filled, cell_h);
+                let fill_clip = graphene::Rect::new(x, 0.0, w_filled, cell_h);
                 snapshot.push_clip(&fill_clip);
                 snapshot.save();
                 snapshot.translate(&text_pt);
@@ -228,53 +253,143 @@ mod bar_renderer {
 }
 
 glib::wrapper! {
-    pub struct DepthBarRenderer(ObjectSubclass<bar_renderer::DepthBarRenderer>)
-        @extends gtk::CellRenderer;
+    pub struct DepthBar(ObjectSubclass<depth_bar::DepthBar>)
+        @extends gtk::Widget,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
 }
 
-impl Default for DepthBarRenderer {
+impl Default for DepthBar {
     fn default() -> Self {
         glib::Object::new()
     }
 }
 
-impl DepthBarRenderer {
-    fn new() -> Self {
-        Self::default()
+// ==============================================================================
+// Custom GObject: per-row data
+// ==============================================================================
+//
+// Every row in the tree is backed by an `EntryItem`. The `ColumnView`
+// factories bind their child widgets to its glib properties, so
+// asynchronous size updates (via the worker pipeline) propagate to the
+// UI just by setting the property — the view's per-row label/bar widget
+// observes `notify::*` and updates itself.
+
+mod entry_item {
+    use std::cell::{Cell, RefCell};
+
+    use gtk::glib;
+    use gtk::glib::Properties;
+    use gtk::glib::subclass::prelude::*;
+    use gtk::prelude::*;
+
+    #[derive(Default, Properties)]
+    #[properties(wrapper_type = super::EntryItem)]
+    pub struct EntryItem {
+        /// Display name. For directories this includes the trailing `/`
+        /// so the eye can pick them out without consulting `is_dir`.
+        #[property(get, set)]
+        pub name: RefCell<String>,
+        /// Pretty-printed size, e.g. `"12.3 MiB"` — what the size column
+        /// actually shows. While a directory's size is in flight, this
+        /// holds [`super::PENDING_SIZE_LABEL`].
+        #[property(get, set)]
+        pub size_human: RefCell<String>,
+        /// Raw byte count, used to sort the size column.
+        #[property(get, set)]
+        pub size_bytes: Cell<u64>,
+        /// 0..=100, drives the share bar's fill width.
+        #[property(get, set, minimum = 0, maximum = 100, default = 0)]
+        pub percent: Cell<i32>,
+        /// Absolute path of this entry. Empty for synthetic rows
+        /// (currently only the `(error: ...)` row that replaces a failed
+        /// enumeration).
+        #[property(get, set)]
+        pub path: RefCell<String>,
+        /// Whether this entry is a directory (and therefore expandable).
+        #[property(get, set)]
+        pub is_dir: Cell<bool>,
+        /// Whether a worker has been dispatched to enumerate this
+        /// directory's children. Latched to `true` on first expansion
+        /// to prevent duplicate dispatches if the user collapses and
+        /// re-expands the row.
+        #[property(get, set)]
+        pub loaded: Cell<bool>,
+        /// Whether the recursive size has finished computing. Kept for
+        /// future use (e.g. a per-row spinner) — currently informational.
+        #[property(get, set)]
+        pub sized: Cell<bool>,
+        /// 0 for top-level rows, +1 per nesting level. Drives the bar
+        /// color via [`super::palette_rgba`].
+        #[property(get, set, minimum = 0, default = 0)]
+        pub depth: Cell<i32>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for EntryItem {
+        const NAME: &'static str = "DiskalyzerEntryItem";
+        type Type = super::EntryItem;
+    }
+
+    #[glib::derived_properties]
+    impl ObjectImpl for EntryItem {}
+}
+
+glib::wrapper! {
+    pub struct EntryItem(ObjectSubclass<entry_item::EntryItem>);
+}
+
+impl Default for EntryItem {
+    fn default() -> Self {
+        glib::Object::new()
     }
 }
 
-// ==============================================================================
-// TreeStore schema
-// ==============================================================================
-//
-// We index columns through this little group of constants rather than via
-// raw integers scattered through the code. The order *must* match the
-// `glib::Type` array passed to `TreeStore::new` below.
+impl EntryItem {
+    /// Build a row item from a freshly-enumerated [`Entry`]. Files get
+    /// their real size up-front; directories carry [`PENDING_SIZE_LABEL`]
+    /// in the size column until the recursive sizer reports back.
+    fn from_entry(entry: &Entry, depth: i32) -> Self {
+        let display_name = if entry.is_dir {
+            format!("{}/", entry.name)
+        } else {
+            entry.name.clone()
+        };
+        let size_human = if entry.is_dir {
+            PENDING_SIZE_LABEL.to_string()
+        } else {
+            humansize::format_size(entry.size_in_bytes, humansize::BINARY)
+        };
+        glib::Object::builder()
+            .property("name", display_name)
+            .property("size-human", size_human)
+            .property("size-bytes", entry.size_in_bytes)
+            .property("percent", 0i32)
+            .property("path", entry.path.display().to_string())
+            .property("is-dir", entry.is_dir)
+            // Files have no children, so they're trivially "loaded".
+            .property("loaded", !entry.is_dir)
+            // Files have a final size already; dirs do not.
+            .property("sized", !entry.is_dir)
+            .property("depth", depth)
+            .build()
+    }
 
-const COL_NAME: u32 = 0; // String — display name (with trailing slash on dirs)
-const COL_SIZE_HUMAN: u32 = 1; // String — pretty-printed size, e.g. "12.3 MiB"
-const COL_SIZE_BYTES: u32 = 2; // u64 — raw bytes, used for sorting
-const COL_PERCENT: u32 = 3; // i32 — 0..=100, drives the bar fill width
-const COL_PATH: u32 = 4; // String — absolute path of this entry
-const COL_IS_DIR: u32 = 5; // bool
-const COL_LOADED: u32 = 6; // bool — whether children have been populated yet
-const COL_SIZED: u32 = 7; // bool — whether the recursive size is final
-const COL_DEPTH: u32 = 8; // i32 — 0 for top-level, +1 per nesting level (drives bar color)
-
-/// Column type vector. Keep in lockstep with the `COL_*` constants above.
-fn store_column_types() -> [glib::Type; 9] {
-    [
-        glib::Type::STRING, // name
-        glib::Type::STRING, // size_human
-        glib::Type::U64,    // size_bytes
-        glib::Type::I32,    // percent
-        glib::Type::STRING, // path
-        glib::Type::BOOL,   // is_dir
-        glib::Type::BOOL,   // loaded
-        glib::Type::BOOL,   // sized
-        glib::Type::I32,    // depth
-    ]
+    /// Build a synthetic row that surfaces an enumeration failure to the
+    /// user. We give it `path = ""` so it never collides with a real
+    /// entry's path-keyed lookup.
+    fn error_row(message: &str, depth: i32) -> Self {
+        glib::Object::builder()
+            .property("name", format!("(error: {message})"))
+            .property("size-human", String::new())
+            .property("size-bytes", 0u64)
+            .property("percent", 0i32)
+            .property("path", String::new())
+            .property("is-dir", false)
+            .property("loaded", true)
+            .property("sized", true)
+            .property("depth", depth)
+            .build()
+    }
 }
 
 /// Sentinel size string shown for directories whose recursive total is
@@ -310,15 +425,11 @@ impl Status {
         }
     }
 
-    /// Account for `n` directories that have just been handed to a
-    /// worker thread. Updates the visible label.
     fn enqueue(&self, n: usize) {
         self.queued.set(self.queued.get() + n);
         self.refresh();
     }
 
-    /// Account for one directory whose subtree size has arrived from a
-    /// worker. Updates the visible label.
     fn complete_one(&self) {
         self.sized.set(self.sized.get() + 1);
         self.refresh();
@@ -329,12 +440,10 @@ impl Status {
         let sized = self.sized.get();
         let pending = queued.saturating_sub(sized);
         let text = if queued == 0 {
-            // Pre-population: the initial enumeration hasn't run yet,
-            // or the directory only contained files.
             "Ready".to_string()
         } else if pending == 0 {
             // ✓ U+2713 — present in standard symbol blocks; renders as
-            // a plain check on every modern terminal/font we care about.
+            // a plain check on every modern font we care about.
             format!("✓ Done — {sized} director{} sized", plural_y(sized))
         } else {
             format!(
@@ -346,9 +455,6 @@ impl Status {
     }
 }
 
-/// English-only quick pluralizer for the "directory/directories" word
-/// used in the status bar. Inlined to avoid pulling a fluent stack for
-/// one label.
 fn plural_y(n: usize) -> &'static str {
     if n == 1 { "y" } else { "ies" }
 }
@@ -359,36 +465,31 @@ fn plural_y(n: usize) -> &'static str {
 
 /// Message sent by a worker thread to the GTK main loop.
 ///
-/// We pass paths rather than `TreeIter`s because:
+/// We pass paths rather than direct `EntryItem` references because:
 ///
-/// - `TreeIter` is not safe to send across threads.
-/// - Sort-induced reorderings would invalidate any iter the worker
-///   captured before sending.
-///
-/// Identifying rows by `COL_PATH` is robust against both.
+/// - Workers can't safely hold GObject references (they're not `Send`).
+/// - A row may be replaced (e.g. when a parent's `(loading…)` placeholder
+///   is swapped for real children) between dispatch and receipt; looking
+///   up by path is robust against that.
 #[derive(Debug)]
 enum WorkerMsg {
     /// A worker finished enumerating the immediate children of a
-    /// directory. The main thread inserts the rows and adds placeholder
-    /// children for any sub-directories.
+    /// directory. The main thread inserts the rows under their parent's
+    /// child store.
     Enumerated {
         /// Path of the directory whose children are being delivered.
-        /// `None` means these are top-level rows.
+        /// `None` means these are top-level rows (children of the
+        /// canonical root).
         parent_path: Option<PathBuf>,
-        /// The freshly-enumerated entries. Files have their real
-        /// `metadata().len()` size; directories carry a 0 placeholder
-        /// size that will be filled in by a later [`WorkerMsg::Sized`].
         entries: Vec<Entry>,
     },
     /// A worker computed the recursive size of a single directory.
     Sized {
-        /// Path that was sized.
         path: PathBuf,
         /// Path of the directory's parent in the tree (`None` for
-        /// top-level dirs). Carried to scope the row lookup; without it
-        /// we'd re-walk the whole model to find the row.
+        /// top-level dirs). Carried so `recompute_percentages` knows
+        /// which sibling group to touch.
         parent_path: Option<PathBuf>,
-        /// The recursively-computed size in bytes.
         size: u64,
     },
     /// `enumerate_children` failed — usually a permissions error. We
@@ -425,10 +526,46 @@ fn main() -> glib::ExitCode {
 // UI construction
 // ==============================================================================
 
-/// Build the main window, the column-aware tree view, and wire up the
-/// lazy-expansion handler. The function ends without taking ownership of
-/// the widgets — GTK keeps them alive through the application instance —
-/// so we leak nothing despite returning early on display.
+/// Shared maps that survive across worker callbacks. We keep them in a
+/// single struct so each helper takes one parameter rather than four.
+///
+/// - `root_model` holds the top-level rows (children of the canonical
+///   root the app was launched against).
+/// - `children_models` is keyed by directory path; entries are inserted
+///   eagerly by the `TreeListModel` create-children closure on first
+///   query and populated later when the worker for that directory
+///   reports back.
+/// - `items_by_path` lets `Sized` updates locate the affected
+///   `EntryItem` in O(1) without walking the model.
+#[derive(Clone)]
+struct Models {
+    root_model: gio::ListStore,
+    children_models: Rc<RefCell<HashMap<PathBuf, gio::ListStore>>>,
+    items_by_path: Rc<RefCell<HashMap<PathBuf, EntryItem>>>,
+}
+
+impl Models {
+    fn new() -> Self {
+        Self {
+            root_model: gio::ListStore::new::<EntryItem>(),
+            children_models: Rc::default(),
+            items_by_path: Rc::default(),
+        }
+    }
+
+    /// Resolve the destination `gio::ListStore` for the given parent
+    /// path. `None` ↔ top level. Returns `None` if the worker raced
+    /// ahead of the create-children closure (shouldn't happen because
+    /// the closure is called eagerly on row exposure, but we treat it
+    /// as a no-op rather than a panic).
+    fn store_for(&self, parent: Option<&Path>) -> Option<gio::ListStore> {
+        match parent {
+            None => Some(self.root_model.clone()),
+            Some(p) => self.children_models.borrow().get(p).cloned(),
+        }
+    }
+}
+
 fn build_ui(app: &Application, root: &Path) {
     let canonical = match std::fs::canonicalize(root) {
         Ok(p) => p,
@@ -441,12 +578,11 @@ fn build_ui(app: &Application, root: &Path) {
         }
     };
 
-    let store = TreeStore::new(&store_column_types());
-    let view = build_tree_view(&store);
+    let models = Models::new();
 
-    // Status bar at the bottom of the window. A single Label inside a
-    // Box leaves room to add other widgets later (a spinner, perhaps, or
-    // a cancel button) without restructuring the layout.
+    // Status bar at the bottom of the window. A single `Label` inside a
+    // `Box` leaves room to add other widgets later (a spinner, perhaps,
+    // or a cancel button) without restructuring the layout.
     let status_label = Label::builder()
         .xalign(0.0)
         .margin_start(8)
@@ -457,50 +593,86 @@ fn build_ui(app: &Application, root: &Path) {
         .build();
     let status = Rc::new(Status::new(status_label.clone()));
 
-    // Channel pair shared by every worker we ever spawn: workers send
-    // `WorkerMsg`s, the consumer task on the GTK main loop receives them
-    // and updates the store. One unbounded channel for the whole app
-    // keeps the wiring simple — there's never more than a few hundred
-    // updates in flight in practice.
+    // One unbounded channel for the whole app — workers send `WorkerMsg`s,
+    // a consumer task on the GTK main loop receives them and updates the
+    // models. Unbounded is fine here because there's never more than a
+    // few hundred updates in flight in practice.
     let (tx, rx) = unbounded::<WorkerMsg>();
 
-    // Spawn the consumer on the GTK main context. `spawn_future_local`
-    // is the modern replacement for the (deprecated) `glib::MainContext::
-    // channel`; the closure is pinned to the main thread so it can mutate
-    // the store directly without any extra synchronization.
+    // Drive the worker → UI pipeline on the GTK main context.
+    // `spawn_future_local` pins the future to the main thread so it can
+    // touch the models directly without any extra synchronization.
     {
-        let store = store.clone();
+        let models = models.clone();
         let status = status.clone();
         glib::spawn_future_local(async move {
-            run_consumer(store, status, rx).await;
+            run_consumer(models, status, rx).await;
         });
     }
+
+    // ----- Tree model (lazy children registration) -----
+    //
+    // The closure runs the first time `TreeListModel` needs an item's
+    // child model — typically when the row scrolls into view and the
+    // expander indicator has to be drawn. We register an *empty* store
+    // synchronously and return it immediately; no filesystem walk happens
+    // here. Population is deferred until the user actually clicks the
+    // expander, observed via `notify::expanded` in the name column
+    // factory below.
+    let create_func = {
+        let children_models = models.children_models.clone();
+        move |obj: &glib::Object| -> Option<gio::ListModel> {
+            let item = obj.downcast_ref::<EntryItem>()?;
+            if !item.is_dir() {
+                return None;
+            }
+            let path = PathBuf::from(item.path());
+            let mut map = children_models.borrow_mut();
+            if let Some(existing) = map.get(&path) {
+                return Some(existing.clone().upcast());
+            }
+            let store = gio::ListStore::new::<EntryItem>();
+            map.insert(path, store.clone());
+            Some(store.upcast())
+        }
+    };
+    // `passthrough = false` means the outer model exposes `TreeListRow`s
+    // (so columns can pick the depth/expander up); `autoexpand = false`
+    // keeps the tree collapsed by default.
+    let tree_model = TreeListModel::new(models.root_model.clone(), false, false, create_func);
+
+    // ----- ColumnView -----
+    let view = ColumnView::builder()
+        .show_row_separators(false)
+        .show_column_separators(false)
+        .reorderable(false)
+        .build();
+
+    let name_col = build_name_column(tx.clone());
+    let size_col = build_size_column();
+    let share_col = build_share_column();
+    view.append_column(&name_col);
+    view.append_column(&size_col);
+    view.append_column(&share_col);
+
+    // Default sort: largest first. That's the question this tool exists
+    // to answer, so we make it the column the user sees as already-sorted.
+    view.sort_by_column(Some(&size_col), gtk::SortType::Descending);
+
+    // Wrap the tree model in a `TreeListRowSorter` so the column-view's
+    // sorter is applied *per level*. Without this wrapper the flat DFS
+    // output would be re-sorted globally, which mangles parent/child
+    // grouping.
+    let row_sorter = TreeListRowSorter::new(view.sorter());
+    let sort_model = SortListModel::new(Some(tree_model), Some(row_sorter));
+    let selection = NoSelection::new(Some(sort_model));
+    view.set_model(Some(&selection));
 
     // Kick off the root: dispatching to a worker keeps the GTK main
     // thread free to render the empty window immediately. The user sees
     // "Sizing…" appear in the status bar within milliseconds rather than
     // staring at an unresponsive window while we walk the filesystem.
     request_populate(None, canonical.clone(), &tx);
-
-    // Lazy expansion. We use `connect_test_expand_row` rather than
-    // `connect_row_expanded` because the former runs *before* the row
-    // visually expands, so the placeholder swap is invisible.
-    let store_for_expand = store.clone();
-    let tx_for_expand = tx.clone();
-    view.connect_test_expand_row(move |_view, iter, _path| {
-        let already_loaded: bool = store_for_expand.get::<bool>(iter, COL_LOADED as i32);
-        if !already_loaded {
-            // Mark loaded *up front* so a re-entrant expand attempt
-            // (rare, but possible if the user keys through the tree
-            // quickly) doesn't dispatch a second worker for the same
-            // directory.
-            store_for_expand.set(iter, &[(COL_LOADED, &true)]);
-            let path_str: String = store_for_expand.get::<String>(iter, COL_PATH as i32);
-            let parent_path = PathBuf::from(&path_str);
-            request_populate(Some(parent_path.clone()), parent_path, &tx_for_expand);
-        }
-        glib::Propagation::Proceed
-    });
 
     let scrolled = ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Automatic)
@@ -533,74 +705,218 @@ fn build_ui(app: &Application, root: &Path) {
     window.present();
 }
 
-/// Build the `TreeView` with three columns: name (with expander), size,
-/// and a progress-bar percent column. The view is configured for sorting
-/// on the size column — that's the question this tool exists to answer,
-/// so we make it the default sort.
-fn build_tree_view(store: &TreeStore) -> TreeView {
-    let view = TreeView::builder()
-        .model(store)
-        .headers_visible(true)
-        .enable_tree_lines(true)
-        .build();
+// ==============================================================================
+// Column factories
+// ==============================================================================
 
-    // --- Name column (with expander triangle) ---
-    let name_col = TreeViewColumn::new();
-    name_col.set_title("Name");
-    name_col.set_resizable(true);
-    name_col.set_min_width(220);
-    let name_renderer = CellRendererText::new();
-    name_col.pack_start(&name_renderer, true);
-    name_col.add_attribute(&name_renderer, "text", COL_NAME as i32);
-    view.append_column(&name_col);
-    view.set_expander_column(Some(&name_col));
+/// Name column: `TreeExpander` containing a `Label`. The expander draws
+/// the indent and disclosure triangle; binding it to the row's
+/// `TreeListRow` is what hooks the click into the tree model.
+///
+/// We also attach a `notify::expanded` listener on the row in `bind` so
+/// that the worker that enumerates a directory's children only fires
+/// when the user actually expands it — not when GTK eagerly queries
+/// expandability. The listener is disconnected in `unbind`, since
+/// factories recycle widgets across rows.
+fn build_name_column(tx: Sender<WorkerMsg>) -> ColumnViewColumn {
+    let factory = SignalListItemFactory::new();
 
-    // --- Size column ---
-    let size_col = TreeViewColumn::new();
-    size_col.set_title("Size");
-    size_col.set_resizable(true);
-    size_col.set_min_width(110);
-    size_col.set_sort_column_id(COL_SIZE_BYTES as i32);
-    let size_renderer = CellRendererText::new();
-    size_renderer.set_xalign(1.0); // right-align numbers
-    size_col.pack_start(&size_renderer, false);
-    size_col.add_attribute(&size_renderer, "text", COL_SIZE_HUMAN as i32);
-    view.append_column(&size_col);
+    factory.connect_setup(|_, obj| {
+        let list_item = obj.downcast_ref::<ListItem>().expect("ListItem");
+        let expander = TreeExpander::new();
+        let label = Label::builder().xalign(0.0).build();
+        expander.set_child(Some(&label));
+        list_item.set_child(Some(&expander));
+    });
 
-    // --- Share column (custom-drawn colored bar) ---
-    //
-    // `DepthBarRenderer` paints a single filled rectangle whose width
-    // is `cell.width * percent / 100` and whose color is picked from a
-    // palette indexed by tree depth. Drawing a true rectangle (rather
-    // than an approximation built from block glyphs) avoids the
-    // hairline seams that block-glyph bars exhibit on most fonts.
-    let share_col = TreeViewColumn::new();
-    share_col.set_title("Share");
-    share_col.set_resizable(true);
-    share_col.set_min_width(180);
-    let bar_renderer = DepthBarRenderer::new();
-    share_col.pack_start(&bar_renderer, true);
-    share_col.add_attribute(&bar_renderer, "percent", COL_PERCENT as i32);
-    share_col.add_attribute(&bar_renderer, "depth", COL_DEPTH as i32);
-    view.append_column(&share_col);
+    factory.connect_bind(move |_, obj| {
+        let list_item = obj.downcast_ref::<ListItem>().expect("ListItem");
+        let row: TreeListRow = list_item.item().and_downcast().expect("TreeListRow");
+        let item: EntryItem = row.item().and_downcast().expect("EntryItem");
+        let expander: TreeExpander = list_item.child().and_downcast().expect("TreeExpander");
+        expander.set_list_row(Some(&row));
+        let label: Label = expander.child().and_downcast().expect("Label");
 
-    // Default sort: largest first. Without an explicit sort the rows
-    // would appear in `read_dir` order, which is filesystem-defined and
-    // never the order a user wants.
-    store.set_sort_column_id(
-        gtk::SortColumn::Index(COL_SIZE_BYTES),
-        gtk::SortType::Descending,
+        // Bind the visible text to the property so a future rename (or
+        // any other property edit) reflects without a re-bind. Stored on
+        // the `ListItem` so `connect_unbind` can release it before the
+        // widget is recycled onto a different row.
+        let binding = item
+            .bind_property("name", &label, "label")
+            .sync_create()
+            .build();
+        unsafe {
+            list_item.set_data::<glib::Binding>("dz-name-binding", binding);
+        }
+
+        // One-shot worker dispatch on first expansion. The `loaded` flag
+        // on the item itself is the ground truth — even if the same
+        // factory bind runs twice for the same item (rare, but possible
+        // through scrolling churn), the second call is a no-op because
+        // the first one set `loaded`.
+        if item.is_dir() && !item.loaded() {
+            let item_for_handler = item.clone();
+            let tx_for_handler = tx.clone();
+            let handler = row.connect_expanded_notify(move |r| {
+                if r.is_expanded() && !item_for_handler.loaded() {
+                    item_for_handler.set_loaded(true);
+                    let p = PathBuf::from(item_for_handler.path());
+                    request_populate(Some(p.clone()), p, &tx_for_handler);
+                }
+            });
+            unsafe {
+                list_item
+                    .set_data::<glib::SignalHandlerId>("dz-expand-handler", handler);
+            }
+        }
+    });
+
+    factory.connect_unbind(|_, obj| {
+        let list_item = obj.downcast_ref::<ListItem>().expect("ListItem");
+        unsafe {
+            if let Some(binding) =
+                list_item.steal_data::<glib::Binding>("dz-name-binding")
+            {
+                binding.unbind();
+            }
+            if let Some(handler) =
+                list_item.steal_data::<glib::SignalHandlerId>("dz-expand-handler")
+            {
+                if let Some(row) = list_item.item().and_downcast::<TreeListRow>() {
+                    row.disconnect(handler);
+                }
+            }
+        }
+    });
+
+    let col = ColumnViewColumn::new(Some("Name"), Some(factory));
+    col.set_resizable(true);
+    col.set_expand(true);
+
+    // Sortable by name — handy when users want alphabetical, even though
+    // size-descending is the default.
+    let name_expr = gtk::PropertyExpression::new(
+        EntryItem::static_type(),
+        None::<&gtk::Expression>,
+        "name",
     );
-
-    view
+    let sorter = gtk::StringSorter::new(Some(name_expr));
+    col.set_sorter(Some(&sorter));
+    col
 }
+
+/// Size column: a right-aligned label bound to `size-human`. Sorts by
+/// the underlying `size-bytes` so "1.0 MiB" sorts above "999 KiB"
+/// (string sort would reverse them).
+fn build_size_column() -> ColumnViewColumn {
+    let factory = SignalListItemFactory::new();
+
+    factory.connect_setup(|_, obj| {
+        let list_item = obj.downcast_ref::<ListItem>().expect("ListItem");
+        let label = Label::builder().xalign(1.0).build();
+        list_item.set_child(Some(&label));
+    });
+
+    factory.connect_bind(|_, obj| {
+        let list_item = obj.downcast_ref::<ListItem>().expect("ListItem");
+        let row: TreeListRow = list_item.item().and_downcast().expect("TreeListRow");
+        let item: EntryItem = row.item().and_downcast().expect("EntryItem");
+        let label: Label = list_item.child().and_downcast().expect("Label");
+        let binding = item
+            .bind_property("size-human", &label, "label")
+            .sync_create()
+            .build();
+        unsafe {
+            list_item.set_data::<glib::Binding>("dz-size-binding", binding);
+        }
+    });
+
+    factory.connect_unbind(|_, obj| {
+        let list_item = obj.downcast_ref::<ListItem>().expect("ListItem");
+        unsafe {
+            if let Some(binding) =
+                list_item.steal_data::<glib::Binding>("dz-size-binding")
+            {
+                binding.unbind();
+            }
+        }
+    });
+
+    let col = ColumnViewColumn::new(Some("Size"), Some(factory));
+    col.set_resizable(true);
+
+    let size_expr = gtk::PropertyExpression::new(
+        EntryItem::static_type(),
+        None::<&gtk::Expression>,
+        "size-bytes",
+    );
+    let sorter = gtk::NumericSorter::builder()
+        .expression(&size_expr)
+        .sort_order(gtk::SortType::Ascending)
+        .build();
+    col.set_sorter(Some(&sorter));
+    col
+}
+
+/// Share column: a `DepthBar` widget bound to the row's `percent` and
+/// `depth`. Two bindings → two `glib::Binding`s to release on unbind;
+/// stored as a `Vec` under one data key.
+fn build_share_column() -> ColumnViewColumn {
+    let factory = SignalListItemFactory::new();
+
+    factory.connect_setup(|_, obj| {
+        let list_item = obj.downcast_ref::<ListItem>().expect("ListItem");
+        let bar = DepthBar::default();
+        list_item.set_child(Some(&bar));
+    });
+
+    factory.connect_bind(|_, obj| {
+        let list_item = obj.downcast_ref::<ListItem>().expect("ListItem");
+        let row: TreeListRow = list_item.item().and_downcast().expect("TreeListRow");
+        let item: EntryItem = row.item().and_downcast().expect("EntryItem");
+        let bar: DepthBar = list_item.child().and_downcast().expect("DepthBar");
+        let bindings: Vec<glib::Binding> = vec![
+            item.bind_property("percent", &bar, "percent")
+                .sync_create()
+                .build(),
+            item.bind_property("depth", &bar, "depth")
+                .sync_create()
+                .build(),
+        ];
+        unsafe {
+            list_item.set_data::<Vec<glib::Binding>>("dz-share-bindings", bindings);
+        }
+    });
+
+    factory.connect_unbind(|_, obj| {
+        let list_item = obj.downcast_ref::<ListItem>().expect("ListItem");
+        unsafe {
+            if let Some(bindings) =
+                list_item.steal_data::<Vec<glib::Binding>>("dz-share-bindings")
+            {
+                for b in bindings {
+                    b.unbind();
+                }
+            }
+        }
+    });
+
+    let col = ColumnViewColumn::new(Some("Share"), Some(factory));
+    col.set_resizable(true);
+    col.set_expand(true);
+    col
+}
+
+// ==============================================================================
+// Workers and the consumer task
+// ==============================================================================
 
 /// Dispatch a worker thread to enumerate `target_path` and then size
 /// each of its sub-directories. Returns immediately so the GTK main
 /// thread is never blocked on filesystem work, even for directories
 /// containing tens of thousands of children.
 ///
-/// `parent_path_for_lookup` identifies which row in the store will host
+/// `parent_path_for_lookup` identifies which row in the model will host
 /// the resulting children — `None` for the very first level under the
 /// app's root. We carry it explicitly so the main-thread handler
 /// doesn't have to remember which worker it dispatched for which row.
@@ -653,41 +969,14 @@ fn request_populate(
 
 /// Drive the GTK-main-thread side of the worker → UI pipeline.
 ///
-/// The consumer batches incoming `Sized` updates and only re-computes
-/// percentage columns at batch boundaries, rather than per-message.
-/// Three things make this scalable to directories with tens of
-/// thousands of children:
-///
-/// 1. **Periodic yield.** Every `YIELD_EVERY` messages, the loop awaits
-///    a zero-duration timeout, which returns control to GTK so it can
-///    paint, dispatch input, and stay responsive. Without this the
-///    consumer would drain a backlog of thousands of queued messages
-///    in a single uninterrupted run.
-///
-/// 2. **Deferred percentage recomputation.** A `Sized` message updates
-///    only its own row's size cell and marks the parent as "dirty".
-///    The dirty set is flushed (one `recompute_percentages` per parent)
-///    when we yield, when we hit a batch boundary, or when an
-///    `Enumerated` message comes through. This collapses what was
-///    O(parent_size) per message into O(parent_size) per batch.
-///
-/// 3. **Last-hit parent-iter cache.** `Sized` messages from the same
-///    worker arrive in clusters by parent. Caching the most recently
-///    found parent iter avoids re-walking the whole model with
-///    `find_row_by_path` for every message in the cluster.
-async fn run_consumer(
-    store: TreeStore,
-    status: Rc<Status>,
-    rx: async_channel::Receiver<WorkerMsg>,
-) {
-    /// How many messages we process before forcing a yield+flush.
+/// Yields control back to GTK every `YIELD_EVERY` messages so a sustained
+/// burst (e.g. sizing a directory with thousands of sub-directories)
+/// can't starve the main loop and freeze the window.
+async fn run_consumer(models: Models, status: Rc<Status>, rx: async_channel::Receiver<WorkerMsg>) {
     /// Picked by feel: large enough that yield overhead is negligible,
     /// small enough that the UI wakes up at least every ~16 ms during
     /// heavy bursts.
     const YIELD_EVERY: usize = 64;
-
-    let mut dirty_parents: HashSet<Option<PathBuf>> = HashSet::new();
-    let mut parent_cache: Option<(PathBuf, TreeIter)> = None;
     let mut since_yield: usize = 0;
 
     while let Ok(msg) = rx.recv().await {
@@ -696,429 +985,180 @@ async fn run_consumer(
                 parent_path,
                 entries,
             } => {
-                // Bulk inserts can shuffle existing rows; invalidate
-                // the parent cache and flush any pending recomputes
-                // before we touch the store wholesale.
-                flush_dirty(&store, &mut dirty_parents);
-                parent_cache = None;
-                apply_enumerated(&store, &status, parent_path, entries).await;
-                since_yield = since_yield.saturating_add(1);
+                apply_enumerated(&models, &status, parent_path, entries);
             }
             WorkerMsg::Sized {
                 path,
                 parent_path,
                 size,
             } => {
-                let parent_iter = lookup_parent_with_cache(
-                    &store,
-                    parent_path.as_ref(),
-                    &mut parent_cache,
-                );
-                update_row_size(&store, parent_iter.as_ref(), &path, size);
-                dirty_parents.insert(parent_path);
+                apply_sized(&models, &path, parent_path.as_deref(), size);
                 status.complete_one();
-                since_yield += 1;
             }
             WorkerMsg::EnumerateFailed {
                 parent_path,
                 message,
             } => {
-                // Keep the exact OS error text — a user debugging a
-                // permission issue can usually recognize the system
-                // string (`Permission denied (os error 13)`) faster
-                // than a generic "could not read".
-                let parent_iter = lookup_parent_with_cache(
-                    &store,
-                    parent_path.as_ref(),
-                    &mut parent_cache,
-                );
-                if let Some(parent_iter) = parent_iter.as_ref() {
-                    while let Some(child) = store.iter_children(Some(parent_iter)) {
-                        store.remove(&child);
-                    }
-                    let label = format!("(error: {message})");
-                    store.insert_with_values(
-                        Some(parent_iter),
-                        None,
-                        &[
-                            (COL_NAME, &label),
-                            (COL_LOADED, &true),
-                            (COL_SIZED, &true),
-                        ],
-                    );
-                }
+                apply_enumerate_failed(&models, parent_path, message);
                 status.refresh();
-                since_yield += 1;
             }
         }
 
-        // Flush+yield on either of two conditions:
-        //
-        // 1. We've hit the per-batch budget — keeps the UI responsive
-        //    during a sustained burst.
-        // 2. The channel has drained to empty — without this, a small
-        //    burst (say a directory with 10 children) would leave its
-        //    final dirty set un-flushed indefinitely, since
-        //    `since_yield` would never cross `YIELD_EVERY`. The
-        //    user-visible symptom was percentage columns frozen at
-        //    whatever value they had at the previous flush.
+        since_yield += 1;
+        // Yield on either of two conditions:
+        // 1. Per-batch budget exceeded — keeps UI responsive in bursts.
+        // 2. Channel just emptied — without this, a small burst would
+        //    leave the loop blocked on `recv` with the GTK main loop
+        //    not having repainted since before the burst started.
         if since_yield >= YIELD_EVERY || rx.is_empty() {
-            flush_dirty(&store, &mut dirty_parents);
             glib::timeout_future(Duration::ZERO).await;
             since_yield = 0;
         }
     }
-
-    // Final flush in case the channel closed mid-batch with pending
-    // dirty parents — keeps the bar columns accurate after the last
-    // worker exits.
-    flush_dirty(&store, &mut dirty_parents);
 }
 
-/// Update only the size cells (`COL_SIZE_BYTES`, `COL_SIZE_HUMAN`,
-/// `COL_SIZED`) of the row identified by `(parent_iter, target_path)`.
-/// Percentages are *not* recomputed here — that's done in batch by
-/// [`flush_dirty`].
-fn update_row_size(
-    store: &TreeStore,
-    parent_iter: Option<&TreeIter>,
-    target_path: &Path,
-    size: u64,
-) {
-    let Some(first_child) = store.iter_children(parent_iter) else {
-        return;
-    };
-    let Some(target) = find_iter_by_path(store, &first_child, target_path) else {
-        return;
-    };
-    let size_human = humansize::format_size(size, humansize::BINARY);
-    store.set(
-        &target,
-        &[
-            (COL_SIZE_BYTES, &size),
-            (COL_SIZE_HUMAN, &size_human),
-            (COL_SIZED, &true),
-        ],
-    );
-}
-
-/// Recompute percentages for every parent path in `dirty`, then clear
-/// the set. Each parent is touched once even if many `Sized` updates
-/// landed under it during the batch.
-fn flush_dirty(store: &TreeStore, dirty: &mut HashSet<Option<PathBuf>>) {
-    for parent_path in dirty.drain() {
-        let parent_iter = match parent_path.as_ref() {
-            None => None,
-            Some(p) => find_row_by_path(store, p),
-        };
-        recompute_percentages(store, parent_iter.as_ref());
-    }
-}
-
-/// Look up the iter for `parent_path`, reusing `cache` if it's a hit.
+/// Replace the children of `parent_path` with freshly-enumerated entries
+/// and recompute the share percentages for that level.
 ///
-/// `Sized` messages from the same worker arrive in clusters by parent,
-/// so a one-slot cache catches almost all of them after the first
-/// lookup. On miss we fall back to the full-tree `find_row_by_path`
-/// and refresh the cache with the result.
-fn lookup_parent_with_cache(
-    store: &TreeStore,
-    parent_path: Option<&PathBuf>,
-    cache: &mut Option<(PathBuf, TreeIter)>,
-) -> Option<TreeIter> {
-    let p = parent_path?;
-    if let Some((cp, ci)) = cache.as_ref()
-        && cp == p
-    {
-        return Some(*ci);
-    }
-    let it = find_row_by_path(store, p)?;
-    *cache = Some((p.clone(), it));
-    Some(it)
-}
-
-/// Apply an `Enumerated` message: insert the freshly-listed children
-/// under their parent row, dropping any placeholder rows already there.
-///
-/// Three things keep this scalable to directories with tens of
-/// thousands of children:
-///
-/// 1. The descending-by-size sort is suspended for the duration of the
-///    inserts. With sort active, GTK reorders the parent's children on
-///    every single insert; suspending turns `O(n²)` worst-case
-///    bookkeeping into `O(n log n)`, applied once when we re-enable
-///    the sort.
-///
-/// 2. Inserts are chunked and the function `await`s between chunks. The
-///    `glib::timeout_future(Duration::ZERO)` returns control to the GTK
-///    main loop, giving it a chance to paint, dispatch input, and
-///    react to the user — so the window stays responsive even when a
-///    huge directory is mid-population.
-///
-/// 3. Placeholder removal and `recompute_percentages` happen once at
-///    the end, not per-row, so they don't compound the per-insert cost.
-async fn apply_enumerated(
-    store: &TreeStore,
+/// We use `extend_from_slice` rather than per-row `append` so the
+/// `SortListModel` wrapping the tree model only re-sorts once per batch,
+/// turning O(n²) sort bookkeeping into O(n log n).
+fn apply_enumerated(
+    models: &Models,
     status: &Rc<Status>,
     parent_path: Option<PathBuf>,
     entries: Vec<Entry>,
 ) {
-    let parent_iter = match parent_path.as_ref() {
-        None => None,
-        Some(p) => find_row_by_path(store, p),
+    let parent_depth = parent_path
+        .as_ref()
+        .and_then(|p| models.items_by_path.borrow().get(p).map(|it| it.depth()))
+        .unwrap_or(-1);
+    let depth = parent_depth + 1;
+
+    let Some(store) = models.store_for(parent_path.as_deref()) else {
+        // Defensive: should not happen because the create-children
+        // closure registers a store before the worker can fire. If it
+        // ever does, dropping the message is preferable to panicking
+        // (the user just sees an empty subtree).
+        return;
     };
 
-    // Pre-count directories before we move `entries`, so the status
-    // counter is updated once for the whole batch.
     let n_dirs = entries.iter().filter(|e| e.is_dir).count();
     if n_dirs > 0 {
         status.enqueue(n_dirs);
     }
 
-    // Suspend the descending-by-size sort while we bulk-insert. With
-    // sort active, GTK reorders the parent's children on every single
-    // insert, which is the actual hang trigger when N is large.
-    let sort_was_active = store
-        .sort_column_id()
-        .filter(|(col, _)| matches!(col, gtk::SortColumn::Index(_)))
-        .is_some();
-    if sort_was_active {
-        store.set_unsorted();
-    }
-
-    // Insert real children *before* removing the placeholder row. If we
-    // removed the placeholder first, GTK would briefly see the parent
-    // row with zero children and auto-collapse it — making the row the
-    // user just expanded snap shut on its own. Keeping at least one
-    // child present at every moment avoids that collapse.
-    //
-    // Inserts are chunked, awaiting between chunks to yield to the
-    // main loop. 256 was picked by feel: small enough that an event
-    // queued during a chunk is processed within ~16 ms (one frame on a
-    // 60 Hz display), large enough that the per-yield scheduling cost
-    // doesn't dominate.
-    const INSERT_CHUNK: usize = 256;
-    for (i, entry) in entries.iter().enumerate() {
-        let row_iter = append_entry_row(store, parent_iter.as_ref(), entry);
-        if entry.is_dir {
-            append_placeholder_row(store, &row_iter);
-        }
-        if (i + 1) % INSERT_CHUNK == 0 {
-            glib::timeout_future(Duration::ZERO).await;
+    // Build the EntryItems and register them by path for later size
+    // updates. We register *before* inserting so a Sized message that
+    // races between extend_from_slice and the next event-loop tick
+    // still finds its target.
+    let new_items: Vec<EntryItem> = entries
+        .iter()
+        .map(|e| EntryItem::from_entry(e, depth))
+        .collect();
+    {
+        let mut by_path = models.items_by_path.borrow_mut();
+        for (entry, item) in entries.iter().zip(new_items.iter()) {
+            by_path.insert(entry.path.clone(), item.clone());
         }
     }
 
-    // Now drop any pre-existing placeholders. We identify them by their
-    // empty `COL_PATH`, which is the sentinel `append_placeholder_row`
-    // sets (real entries always have a non-empty path).
-    let placeholders = collect_placeholder_iters(store, parent_iter.as_ref());
-    for it in &placeholders {
-        store.remove(it);
+    // Replace the store's contents in one shot. The previous contents
+    // are typically empty (a freshly-registered child store) but we
+    // call `remove_all` for the rare cases where a re-enumeration
+    // reuses the same store.
+    if store.n_items() > 0 {
+        store.remove_all();
+    }
+    if !new_items.is_empty() {
+        store.extend_from_slice(&new_items);
     }
 
-    if sort_was_active {
-        store.set_sort_column_id(
-            gtk::SortColumn::Index(COL_SIZE_BYTES),
-            gtk::SortType::Descending,
-        );
-    }
-
-    recompute_percentages(store, parent_iter.as_ref());
+    recompute_percentages(&store);
 
     if n_dirs == 0 {
-        // Refresh the bar so a directory that turned out to contain no
-        // sub-directories still flips back to "Done" if nothing else
-        // is in flight.
+        // No further Sized messages will arrive for this level — flip
+        // the status bar back to "Done" if nothing else is in flight.
         status.refresh();
     }
 }
 
-/// Collect every direct child iter of `parent` whose `COL_PATH` is
-/// empty — the marker that distinguishes synthetic "(loading…)" rows
-/// from real entries.
-fn collect_placeholder_iters(store: &TreeStore, parent: Option<&TreeIter>) -> Vec<TreeIter> {
-    let mut out = Vec::new();
-    let Some(first) = store.iter_children(parent) else {
-        return out;
-    };
-    let mut iter = first;
-    loop {
-        let path: String = store.get::<String>(&iter, COL_PATH as i32);
-        if path.is_empty() {
-            out.push(iter);
-        }
-        if !store.iter_next(&mut iter) {
-            break;
-        }
-    }
-    out
-}
-
-/// Append a single entry row and return its iter. The `Entry`'s
-/// `size_in_bytes` is used as-is, so files appear at their real size
-/// immediately while directories appear at zero (and are updated later
-/// by the worker pipeline).
-fn append_entry_row(
-    store: &TreeStore,
-    parent: Option<&TreeIter>,
-    entry: &Entry,
-) -> TreeIter {
-    let display_name = if entry.is_dir {
-        format!("{}/", entry.name)
-    } else {
-        entry.name.clone()
-    };
-    let size_human = if entry.is_dir {
-        PENDING_SIZE_LABEL.to_string()
-    } else {
-        humansize::format_size(entry.size_in_bytes, humansize::BINARY)
-    };
-    let depth = child_depth(store, parent);
-
-    store.insert_with_values(
-        parent,
-        None,
-        &[
-            (COL_NAME, &display_name),
-            (COL_SIZE_HUMAN, &size_human),
-            (COL_SIZE_BYTES, &entry.size_in_bytes),
-            (COL_PERCENT, &0i32),
-            (COL_PATH, &entry.path.display().to_string()),
-            (COL_IS_DIR, &entry.is_dir),
-            // Files have no children, so they're trivially "loaded".
-            (COL_LOADED, &!entry.is_dir),
-            // Files have a final size already; dirs do not.
-            (COL_SIZED, &!entry.is_dir),
-            (COL_DEPTH, &depth),
-        ],
-    )
-}
-
-/// Append a synthetic placeholder child to `parent`. Its sole purpose is
-/// to make GTK render a disclosure triangle on the parent — we replace
-/// it with real children the first time the user expands the row.
-fn append_placeholder_row(store: &TreeStore, parent: &TreeIter) {
-    let depth = child_depth(store, Some(parent));
-    store.insert_with_values(
-        Some(parent),
-        None,
-        &[
-            (COL_NAME, &"(loading…)"),
-            (COL_SIZE_HUMAN, &""),
-            (COL_SIZE_BYTES, &0u64),
-            // Zero percent leaves the bar empty for placeholder rows so
-            // the user doesn't mistake them for sized entries.
-            (COL_PERCENT, &0i32),
-            (COL_PATH, &""),
-            (COL_IS_DIR, &false),
-            (COL_LOADED, &true),
-            (COL_SIZED, &true),
-            (COL_DEPTH, &depth),
-        ],
-    );
-}
-
-/// Read the depth a freshly-inserted child should carry. Top-level
-/// rows are depth 0; everything else is `parent.depth + 1`.
-fn child_depth(store: &TreeStore, parent: Option<&TreeIter>) -> i32 {
-    match parent {
-        None => 0,
-        Some(p) => store.get::<i32>(p, COL_DEPTH as i32) + 1,
-    }
-}
-
-/// Walk the children of `parent` (or the top level if `None`) and
-/// update each row's percent column to its share of the level's total.
-/// Cheap O(n²) since rows-per-level is small in practice.
-fn recompute_percentages(store: &TreeStore, parent: Option<&TreeIter>) {
-    let mut total: u64 = 0;
-    if let Some(first) = store.iter_children(parent) {
-        let mut iter = first;
-        loop {
-            let placeholder_path: String = store.get::<String>(&iter, COL_PATH as i32);
-            // Skip the synthetic "(loading…)" placeholder row which has
-            // an empty COL_PATH and would otherwise inflate the total
-            // with its zero size — harmless, but it's also wrong to
-            // include it in the count.
-            if !placeholder_path.is_empty() {
-                let size: u64 = store.get::<u64>(&iter, COL_SIZE_BYTES as i32);
-                total = total.saturating_add(size);
-            }
-            if !store.iter_next(&mut iter) {
-                break;
-            }
-        }
-    }
-
-    if let Some(first) = store.iter_children(parent) {
-        let mut iter = first;
-        loop {
-            let placeholder_path: String = store.get::<String>(&iter, COL_PATH as i32);
-            if !placeholder_path.is_empty() {
-                let size: u64 = store.get::<u64>(&iter, COL_SIZE_BYTES as i32);
-                let percent = if total == 0 {
-                    0
-                } else {
-                    ((size as u128 * 100) / total as u128) as i32
-                };
-                store.set(&iter, &[(COL_PERCENT, &percent)]);
-            }
-            if !store.iter_next(&mut iter) {
-                break;
-            }
-        }
-    }
-}
-
-/// Locate any iter in the model whose `COL_PATH` matches `path`,
-/// regardless of nesting depth. Used to scope child-row lookups when
-/// applying a `SizeUpdate` whose parent might live anywhere in the tree.
-///
-/// Earlier this function only searched the top level, which silently
-/// dropped updates for deeply-nested rows: a level-3 entry's parent
-/// lives at level 2, not at the top, so its size never made it into
-/// the store.
-fn find_row_by_path(store: &TreeStore, path: &Path) -> Option<TreeIter> {
-    use std::cell::RefCell;
-    let target = path.to_string_lossy().into_owned();
-    // `foreach` takes an `Fn` closure (note: not `FnMut`) so we shuttle
-    // the find result through a `RefCell`. Returning `true` from the
-    // closure stops the walk early.
-    let found: RefCell<Option<TreeIter>> = RefCell::new(None);
-    store.foreach(|model, _tree_path, iter| {
-        let path_str: String = model.get::<String>(iter, COL_PATH as i32);
-        if path_str == target {
-            *found.borrow_mut() = Some(*iter);
-            true
+/// Apply a `Sized` update: write the new size to the affected
+/// `EntryItem` and recompute its parent's percentages.
+fn apply_sized(models: &Models, path: &Path, parent_path: Option<&Path>, size: u64) {
+    {
+        let by_path = models.items_by_path.borrow();
+        if let Some(item) = by_path.get(path) {
+            item.set_size_bytes(size);
+            item.set_size_human(humansize::format_size(size, humansize::BINARY));
+            item.set_sized(true);
         } else {
-            false
+            // A Sized message for a row we don't know about: probably
+            // the parent was re-enumerated and the row no longer exists.
+            // Drop silently.
+            return;
         }
-    });
-    found.into_inner()
+    }
+    if let Some(store) = models.store_for(parent_path) {
+        recompute_percentages(&store);
+    }
 }
 
-/// Walk `iter` and its later siblings until a row whose `COL_PATH`
-/// equals `target.display()` is found.
-fn find_iter_by_path(store: &TreeStore, first: &TreeIter, target: &Path) -> Option<TreeIter> {
-    let target = target.to_string_lossy().into_owned();
-    find_iter_by_path_inner(store, *first, &target)
+/// Replace the children of `parent_path` with a single synthetic error
+/// row carrying the OS error message. We keep the exact OS error text
+/// so a user debugging a permission issue can recognize the system
+/// string (`Permission denied (os error 13)`) faster than a generic
+/// "could not read".
+fn apply_enumerate_failed(models: &Models, parent_path: Option<PathBuf>, message: String) {
+    let parent_depth = parent_path
+        .as_ref()
+        .and_then(|p| models.items_by_path.borrow().get(p).map(|it| it.depth()))
+        .unwrap_or(-1);
+    let depth = parent_depth + 1;
+    let Some(store) = models.store_for(parent_path.as_deref()) else {
+        return;
+    };
+    if store.n_items() > 0 {
+        store.remove_all();
+    }
+    let err_item = EntryItem::error_row(&message, depth);
+    store.append(&err_item);
 }
 
-fn find_iter_by_path_inner(
-    store: &TreeStore,
-    mut iter: TreeIter,
-    target: &str,
-) -> Option<TreeIter> {
-    loop {
-        let path_str: String = store.get::<String>(&iter, COL_PATH as i32);
-        if path_str == target {
-            return Some(iter);
+/// Walk the items in `store` and update each `percent` property to its
+/// share of the level's total size. Called once per batched update —
+/// cheap because it's O(n) in the *level's* size, not the whole tree.
+fn recompute_percentages(store: &gio::ListStore) {
+    let n = store.n_items();
+    let mut total: u64 = 0;
+    for i in 0..n {
+        if let Some(item) = store.item(i).and_downcast::<EntryItem>() {
+            // Skip synthetic error rows — they have an empty path and
+            // would otherwise inflate the total with their zero size
+            // (harmless, but it's also wrong to count them).
+            if !item.path().is_empty() {
+                total = total.saturating_add(item.size_bytes());
+            }
         }
-        if !store.iter_next(&mut iter) {
-            return None;
+    }
+    for i in 0..n {
+        if let Some(item) = store.item(i).and_downcast::<EntryItem>() {
+            if item.path().is_empty() {
+                continue;
+            }
+            let percent = if total == 0 {
+                0
+            } else {
+                ((item.size_bytes() as u128 * 100) / total as u128) as i32
+            };
+            item.set_percent(percent);
         }
     }
 }
+
+// ==============================================================================
+// Failure window
+// ==============================================================================
 
 /// Build a minimal error window when the analysis can't even start. We
 /// intentionally don't reuse the main window scaffolding — it's helpful
