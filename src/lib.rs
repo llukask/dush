@@ -1,16 +1,16 @@
-//! # Diskalyzer
+//! # dush
 //!
 //! A library for analyzing disk space usage of a directory by computing
 //! the total recursive size of each of its immediate children.
 //!
 //! The heavy lifting — parallel directory traversal and (where supported)
 //! deduplication of files referenced by multiple hardlinks — is done by the
-//! [`diskus`] crate. Diskalyzer composes that primitive into a per-child
+//! [`diskus`] crate. `dush` composes that primitive into a per-child
 //! breakdown suitable for rendering as a "what is taking up space here?"
 //! report.
 //!
 //! ```no_run
-//! use diskalyzer::{analyze, AnalyzeOptions};
+//! use dush::{analyze, AnalyzeOptions};
 //!
 //! let analysis = analyze(".", &AnalyzeOptions::default()).unwrap();
 //! for entry in analysis.entries() {
@@ -311,7 +311,7 @@ pub fn subtree_size<P: AsRef<Path>>(
     // We deliberately leave `Directories` at its default `Auto`, which makes
     // `diskus` mirror `du`'s behavior: directory inodes contribute to the
     // disk-usage count but not to the apparent-size count. That keeps the
-    // numbers reported by diskalyzer comparable to what `du -sh` /
+    // numbers reported by dush comparable to what `du -sh` /
     // `du -sb --apparent-size` users already expect.
     let mut usage = DiskUsage::new([path.as_ref()]);
     if opts.apparent_size {

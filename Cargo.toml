@@ -1,5 +1,5 @@
 [package]
-name = "diskalyzer"
+name = "dush"
 version = "0.1.0"
 edition = "2024"
 
@@ -30,10 +30,10 @@ tempfile = "3.27.0"
 # without it, `cargo build` on a machine without GTK system libs would
 # fail to build the GUI bin even though the user only asked for the CLI.
 [[bin]]
-name = "diskalyzer"
+name = "dush"
 path = "src/main.rs"
 
 [[bin]]
-name = "diskalyzer-gui"
-path = "src/bin/diskalyzer-gui.rs"
+name = "dush-gui"
+path = "src/bin/dush-gui.rs"
 required-features = ["gui"]

@@ -1,6 +1,6 @@
-//! # Diskalyzer GUI
+//! # dush GUI
 //!
-//! GTK4 front-end for the `diskalyzer` library. The window appears
+//! GTK4 front-end for the `dush` library. The window appears
 //! immediately with the layout of every directory level the user has
 //! visited so far; subtree sizes stream in afterwards from background
 //! workers. Clicking a directory's expander triggers the same
@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! nix develop
-//! cargo run --features gui --bin diskalyzer-gui -- ~/dev
+//! cargo run --features gui --bin dush-gui -- ~/dev
 //! ```
 //!
 //! ## Architecture
@@ -44,7 +44,7 @@ use gtk::{
     TreeListModel, TreeListRow, TreeListRowSorter,
 };
 
-use diskalyzer::{AnalyzeOptions, Entry, enumerate_children, subtree_size};
+use dush::{AnalyzeOptions, Entry, enumerate_children, subtree_size};
 
 // ==============================================================================
 // Color palette
@@ -128,7 +128,7 @@ mod depth_bar {
 
     #[glib::object_subclass]
     impl ObjectSubclass for DepthBar {
-        const NAME: &'static str = "DiskalyzerDepthBar";
+        const NAME: &'static str = "DushDepthBar";
         type Type = super::DepthBar;
         type ParentType = gtk::Widget;
     }
@@ -326,7 +326,7 @@ mod entry_item {
 
     #[glib::object_subclass]
     impl ObjectSubclass for EntryItem {
-        const NAME: &'static str = "DiskalyzerEntryItem";
+        const NAME: &'static str = "DushEntryItem";
         type Type = super::EntryItem;
     }
 
@@ -512,7 +512,7 @@ fn main() -> glib::ExitCode {
         .unwrap_or_else(|| PathBuf::from("."));
 
     let app = Application::builder()
-        .application_id("dev.diskalyzer.gui")
+        .application_id("dev.dush.gui")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
 
@@ -691,12 +691,12 @@ fn build_ui(app: &Application, root: &Path) {
     layout.append(&status_label);
 
     let header = HeaderBar::new();
-    let title = Label::new(Some(&format!("Diskalyzer — {}", canonical.display())));
+    let title = Label::new(Some(&format!("dush — {}", canonical.display())));
     header.set_title_widget(Some(&title));
 
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("Diskalyzer")
+        .title("dush")
         .default_width(900)
         .default_height(600)
         .child(&layout)
@@ -1177,7 +1177,7 @@ fn show_error_window(app: &Application, message: &str) {
     container.append(&label);
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("Diskalyzer — error")
+        .title("dush — error")
         .default_width(520)
         .default_height(160)
         .child(&container)

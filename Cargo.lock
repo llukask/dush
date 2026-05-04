@@ -307,7 +307,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "diskalyzer"
+name = "diskus"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec07379c016f78e7ddcd953663b9ed17928ff384928d34d824ed7e463bd3d908"
+dependencies = [
+ "atty",
+ "clap",
+ "crossbeam-channel",
+ "humansize",
+ "num-format",
+ "rayon",
+]
+
+[[package]]
+name = "dush"
 version = "0.1.0"
 dependencies = [
  "async-channel",
@@ -321,20 +335,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
-]
-
-[[package]]
-name = "diskus"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec07379c016f78e7ddcd953663b9ed17928ff384928d34d824ed7e463bd3d908"
-dependencies = [
- "atty",
- "clap",
- "crossbeam-channel",
- "humansize",
- "num-format",
- "rayon",
 ]
 
 [[package]]

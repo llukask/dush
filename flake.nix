@@ -1,5 +1,5 @@
 {
-  description = "diskalyzer dev shell — Rust toolchain + GTK4 system libs for the GUI binary";
+  description = "dush dev shell — Rust toolchain + GTK4 system libs for the GUI binary";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

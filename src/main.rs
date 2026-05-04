@@ -1,15 +1,15 @@
-//! # Diskalyzer CLI
+//! # dush CLI
 //!
 //! Interactive disk-usage breakdown for a directory. Given a path, prints
 //! its immediate children sorted by size descending, with a unicode bar
 //! visualization and a percent-of-total column. Sizing uses the `diskus`
-//! crate via the `diskalyzer` library, so traversal is parallelized and
+//! crate via the `dush` library, so traversal is parallelized and
 //! hardlinks are deduplicated where the platform supports it.
 //!
 //! Example:
 //!
 //! ```text
-//! $ diskalyzer ~/dev
+//! $ dush ~/dev
 //!   3.4 GiB  ████████████████░░░░░░░░  68.1%  big-monorepo/
 //!   1.2 GiB  ████████░░░░░░░░░░░░░░░░  24.3%  rust-projects/
 //! 280.0 MiB  █░░░░░░░░░░░░░░░░░░░░░░░   5.5%  scratch/
@@ -24,7 +24,7 @@ use clap::{Parser, ValueEnum};
 use color_eyre::eyre::{Context, Result};
 use humansize::{format_size, BINARY};
 
-use diskalyzer::{analyze, analyze_with_progress, AnalyzeOptions, Analysis, Entry, Progress};
+use dush::{analyze, analyze_with_progress, AnalyzeOptions, Analysis, Entry, Progress};
 
 // ==============================================================================
 // CLI surface
@@ -32,7 +32,7 @@ use diskalyzer::{analyze, analyze_with_progress, AnalyzeOptions, Analysis, Entry
 
 /// Analyze disk space usage of a directory by listing its largest children.
 #[derive(Debug, Parser)]
-#[command(name = "diskalyzer", version, about, long_about = None)]
+#[command(name = "dush", version, about, long_about = None)]
 struct Cli {
     /// Directory to analyze. Defaults to the current working directory.
     #[arg(default_value = ".")]
@@ -67,7 +67,7 @@ struct Cli {
 }
 
 /// Output format selector. The `pretty` variant produces the unicode-bar
-/// report that `diskalyzer` shows by default; the others produce machine-
+/// report that `dush` shows by default; the others produce machine-
 /// readable output suitable for piping into another tool.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum OutputFormat {
@@ -438,7 +438,7 @@ fn collect_rows(
 /// Print a warning footer summarizing inaccessible paths, if any.
 ///
 /// Warnings go to stderr so they don't pollute the structured stdout
-/// report — a user piping diskalyzer into another tool still gets clean
+/// report — a user piping dush into another tool still gets clean
 /// data while the warnings remain visible interactively. If there are many
 /// errors we cap the per-path listing and append a counter; users
 /// debugging permissions issues are typically interested in the *kinds* of
