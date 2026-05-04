@@ -221,8 +221,7 @@ where
     let read = fs::read_dir(&canonical)
         .with_context(|| format!("while reading directory {}", canonical.display()))?;
     for child in read {
-        let child =
-            child.with_context(|| format!("while iterating {}", canonical.display()))?;
+        let child = child.with_context(|| format!("while iterating {}", canonical.display()))?;
         children.push(child.path());
     }
 
@@ -304,10 +303,7 @@ where
 /// thread — the eager [`analyze`] path sizes everything serially before
 /// returning, which is fine for a CLI but makes the GUI feel sluggish at
 /// startup when the root has many large children.
-pub fn subtree_size<P: AsRef<Path>>(
-    path: P,
-    opts: &AnalyzeOptions,
-) -> (u64, Vec<AnalysisError>) {
+pub fn subtree_size<P: AsRef<Path>>(path: P, opts: &AnalyzeOptions) -> (u64, Vec<AnalysisError>) {
     // We deliberately leave `Directories` at its default `Auto`, which makes
     // `diskus` mirror `du`'s behavior: directory inodes contribute to the
     // disk-usage count but not to the apparent-size count. That keeps the
@@ -344,8 +340,7 @@ pub fn enumerate_children<P: AsRef<Path>>(root: P) -> Result<Vec<Entry>> {
 
     let mut out = Vec::new();
     for child in read {
-        let child =
-            child.with_context(|| format!("while iterating {}", canonical.display()))?;
+        let child = child.with_context(|| format!("while iterating {}", canonical.display()))?;
         let path = child.path();
         // Skip entries whose metadata is unreadable; the GUI shows them
         // later via [`subtree_size`]'s error channel if they end up
@@ -472,24 +467,20 @@ mod tests {
         // structural properties (paired Start/Finish per child, single
         // terminal Done).
         let mut events: Vec<String> = Vec::new();
-        analyze_with_progress(
-            tmp.path(),
-            &AnalyzeOptions::default(),
-            |p| match p {
-                Progress::Started { index, total, name } => {
-                    events.push(format!("S/{index}/{total}/{name}"));
-                }
-                Progress::Finished {
-                    index,
-                    total,
-                    name,
-                    size_in_bytes,
-                } => {
-                    events.push(format!("F/{index}/{total}/{name}/{size_in_bytes}"));
-                }
-                Progress::Done => events.push("D".into()),
-            },
-        )
+        analyze_with_progress(tmp.path(), &AnalyzeOptions::default(), |p| match p {
+            Progress::Started { index, total, name } => {
+                events.push(format!("S/{index}/{total}/{name}"));
+            }
+            Progress::Finished {
+                index,
+                total,
+                name,
+                size_in_bytes,
+            } => {
+                events.push(format!("F/{index}/{total}/{name}/{size_in_bytes}"));
+            }
+            Progress::Done => events.push("D".into()),
+        })
         .expect("analyze");
 
         // Two children → 2 Started + 2 Finished + 1 Done = 5 events.
@@ -533,10 +524,7 @@ mod tests {
         let analysis = analyze(tmp.path(), &AnalyzeOptions::default());
 
         // Restore permissions unconditionally so cleanup succeeds.
-        let _ = std::fs::set_permissions(
-            &restricted,
-            std::fs::Permissions::from_mode(0o755),
-        );
+        let _ = std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o755));
 
         let analysis = analysis.expect("analyze should not fatally error");
         assert!(
@@ -548,12 +536,19 @@ mod tests {
             .errors()
             .iter()
             .any(|e| e.path().starts_with(&restricted));
-        assert!(mentions, "errors should reference the restricted path: {:?}", analysis.errors());
+        assert!(
+            mentions,
+            "errors should reference the restricted path: {:?}",
+            analysis.errors()
+        );
     }
 
     #[test]
     fn missing_root_returns_error() {
-        let result = analyze("/nonexistent/path/should/never/exist", &AnalyzeOptions::default());
+        let result = analyze(
+            "/nonexistent/path/should/never/exist",
+            &AnalyzeOptions::default(),
+        );
         assert!(result.is_err());
     }
 }

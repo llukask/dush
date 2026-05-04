@@ -22,9 +22,9 @@ use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
 use color_eyre::eyre::{Context, Result};
-use humansize::{format_size, BINARY};
+use humansize::{BINARY, format_size};
 
-use dush::{analyze, analyze_with_progress, AnalyzeOptions, Analysis, Entry, Progress};
+use dush::{Analysis, AnalyzeOptions, Entry, Progress, analyze, analyze_with_progress};
 
 // ==============================================================================
 // CLI surface
@@ -153,8 +153,7 @@ impl ProgressReporter {
                 // Braille-pattern spinner — present in essentially every
                 // unicode font shipped this decade and visually quieter
                 // than the spinning "/-\|" ASCII alternative.
-                const SPINNER: [char; 10] =
-                    ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+                const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
                 let glyph = SPINNER[self.spinner_idx % SPINNER.len()];
                 self.spinner_idx = self.spinner_idx.wrapping_add(1);
 
@@ -229,13 +228,13 @@ const BAR_WIDTH: usize = 24;
 /// both surfaces sees the same per-depth color. Listed in the order
 /// `(open_escape, …)` so we can index by `depth % len`.
 const ANSI_DEPTH_PALETTE: &[&str] = &[
-    "\x1b[38;2;53;132;228m",  // blue
-    "\x1b[38;2;51;209;122m",  // green
-    "\x1b[38;2;246;211;45m",  // yellow
-    "\x1b[38;2;255;120;0m",   // orange
-    "\x1b[38;2;224;27;36m",   // red
-    "\x1b[38;2;145;65;172m",  // purple
-    "\x1b[38;2;181;131;90m",  // brown
+    "\x1b[38;2;53;132;228m", // blue
+    "\x1b[38;2;51;209;122m", // green
+    "\x1b[38;2;246;211;45m", // yellow
+    "\x1b[38;2;255;120;0m",  // orange
+    "\x1b[38;2;224;27;36m",  // red
+    "\x1b[38;2;145;65;172m", // purple
+    "\x1b[38;2;181;131;90m", // brown
 ];
 const ANSI_RESET: &str = "\x1b[0m";
 
@@ -289,12 +288,7 @@ struct RenderRow {
 /// listing; with higher values we recursively analyze each top-N
 /// directory and indent its top-N children underneath, drawing standard
 /// `tree(1)`-style connectors so the structure is obvious.
-fn print_report(
-    analysis: &Analysis,
-    top: Option<usize>,
-    levels: usize,
-    opts: &AnalyzeOptions,
-) {
+fn print_report(analysis: &Analysis, top: Option<usize>, levels: usize, opts: &AnalyzeOptions) {
     // Collect every row we plan to print up front. Two reasons:
     //
     // 1. The size column is right-aligned to the widest size string we
@@ -374,12 +368,13 @@ fn print_report(
     let separator_width = size_col_width.max(total_str.len());
     println!("  {}", "━".repeat(separator_width));
     let truncated = top.is_some_and(|n| n < analysis.entries().len()) || levels > 1;
-    let label = if truncated {
-        "total (root)"
-    } else {
-        "total"
-    };
-    println!("Σ {:>width$}   {}", total_str, label, width = separator_width);
+    let label = if truncated { "total (root)" } else { "total" };
+    println!(
+        "Σ {:>width$}   {}",
+        total_str,
+        label,
+        width = separator_width
+    );
 
     print_warnings(analysis);
 }
@@ -500,7 +495,10 @@ fn render_text(analysis: &Analysis, top: Option<usize>) {
     // Pre-format both size columns so we can right-align them. Right-
     // alignment is the convention for numbers and lets the eye scan
     // magnitudes without having to read every digit.
-    let bytes_strs: Vec<String> = visible.iter().map(|e| e.size_in_bytes.to_string()).collect();
+    let bytes_strs: Vec<String> = visible
+        .iter()
+        .map(|e| e.size_in_bytes.to_string())
+        .collect();
     let human_strs: Vec<String> = visible
         .iter()
         .map(|e| format_size(e.size_in_bytes, size_opts))

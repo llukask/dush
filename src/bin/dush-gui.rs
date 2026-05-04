@@ -146,22 +146,15 @@ mod depth_bar {
     }
 
     impl WidgetImpl for DepthBar {
-        fn measure(
-            &self,
-            orientation: gtk::Orientation,
-            _for_size: i32,
-        ) -> (i32, i32, i32, i32) {
+        fn measure(&self, orientation: gtk::Orientation, _for_size: i32) -> (i32, i32, i32, i32) {
             // Min width keeps the column from collapsing past the point
             // where the bar is meaningful; nat width is what the layout
             // hands us when the column gets surplus space.
             match orientation {
                 gtk::Orientation::Horizontal => (60, 240, -1, -1),
-                gtk::Orientation::Vertical => (
-                    BAR_HEIGHT_PX as i32 + 4,
-                    BAR_HEIGHT_PX as i32 + 4,
-                    -1,
-                    -1,
-                ),
+                gtk::Orientation::Vertical => {
+                    (BAR_HEIGHT_PX as i32 + 4, BAR_HEIGHT_PX as i32 + 4, -1, -1)
+                }
                 _ => (0, 0, -1, -1),
             }
         }
@@ -224,12 +217,7 @@ mod depth_bar {
 
             // Pass 1: portion of text that lies over the empty track.
             if w_filled < w_total {
-                let track_clip = graphene::Rect::new(
-                    x + w_filled,
-                    0.0,
-                    w_total - w_filled,
-                    cell_h,
-                );
+                let track_clip = graphene::Rect::new(x + w_filled, 0.0, w_total - w_filled, cell_h);
                 snapshot.push_clip(&track_clip);
                 snapshot.save();
                 snapshot.translate(&text_pt);
@@ -765,8 +753,7 @@ fn build_name_column(tx: Sender<WorkerMsg>) -> ColumnViewColumn {
                 }
             });
             unsafe {
-                list_item
-                    .set_data::<glib::SignalHandlerId>("dz-expand-handler", handler);
+                list_item.set_data::<glib::SignalHandlerId>("dz-expand-handler", handler);
             }
         }
     });
@@ -774,9 +761,7 @@ fn build_name_column(tx: Sender<WorkerMsg>) -> ColumnViewColumn {
     factory.connect_unbind(|_, obj| {
         let list_item = obj.downcast_ref::<ListItem>().expect("ListItem");
         unsafe {
-            if let Some(binding) =
-                list_item.steal_data::<glib::Binding>("dz-name-binding")
-            {
+            if let Some(binding) = list_item.steal_data::<glib::Binding>("dz-name-binding") {
                 binding.unbind();
             }
             if let Some(handler) =
@@ -795,11 +780,8 @@ fn build_name_column(tx: Sender<WorkerMsg>) -> ColumnViewColumn {
 
     // Sortable by name — handy when users want alphabetical, even though
     // size-descending is the default.
-    let name_expr = gtk::PropertyExpression::new(
-        EntryItem::static_type(),
-        None::<&gtk::Expression>,
-        "name",
-    );
+    let name_expr =
+        gtk::PropertyExpression::new(EntryItem::static_type(), None::<&gtk::Expression>, "name");
     let sorter = gtk::StringSorter::new(Some(name_expr));
     col.set_sorter(Some(&sorter));
     col
@@ -834,9 +816,7 @@ fn build_size_column() -> ColumnViewColumn {
     factory.connect_unbind(|_, obj| {
         let list_item = obj.downcast_ref::<ListItem>().expect("ListItem");
         unsafe {
-            if let Some(binding) =
-                list_item.steal_data::<glib::Binding>("dz-size-binding")
-            {
+            if let Some(binding) = list_item.steal_data::<glib::Binding>("dz-size-binding") {
                 binding.unbind();
             }
         }
@@ -891,8 +871,7 @@ fn build_share_column() -> ColumnViewColumn {
     factory.connect_unbind(|_, obj| {
         let list_item = obj.downcast_ref::<ListItem>().expect("ListItem");
         unsafe {
-            if let Some(bindings) =
-                list_item.steal_data::<Vec<glib::Binding>>("dz-share-bindings")
+            if let Some(bindings) = list_item.steal_data::<Vec<glib::Binding>>("dz-share-bindings")
             {
                 for b in bindings {
                     b.unbind();
