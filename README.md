@@ -52,6 +52,6 @@ cargo install --path . --features gui   # CLI + GUI
   plus `pkg-config` at build time. On NixOS, `nix develop` in this repo
   drops you into a shell that has them all.
 
-  ## License
+## License
 
-  MIT - see [LICENSE](LICENSE)
+MIT - see [LICENSE](LICENSE)
