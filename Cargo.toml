@@ -2,6 +2,8 @@
 name = "dush"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+license = "MIT"
 
 [features]
 # Enables the GTK4 GUI binary. Off by default so a plain `cargo build`
