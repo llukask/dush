@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
+description = "Faster `du -sh *` using diskus, with an optional GTK4 GUI."
+readme = "README.md"
+keywords = ["disk-usage", "du", "filesystem", "cli", "gtk4"]
+categories = ["command-line-utilities", "filesystem"]
 
 [features]
 # Enables the GTK4 GUI binary. Off by default so a plain `cargo build`
