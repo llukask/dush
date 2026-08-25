@@ -1,0 +1,75 @@
+name: release
+
+# Only the CLI binary `dush` is published here, and only for x86_64 Linux.
+# `dush-gui` is left out on purpose: it links GTK4 dynamically against
+# system libraries, so there is no tarball we could hand out that runs on
+# an arbitrary distro. Nix users get the GUI via `nix run .#dush-gui`.
+# TODO: if GUI distribution is ever wanted, Flatpak (or a similar bundle
+# format that ships the GTK stack) is the right vehicle, not this workflow.
+# TODO: an aarch64 build would be a second matrix entry on an
+# `ubuntu-24.04-arm` runner if demand shows up.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  # musl gives a fully static binary that runs on any glibc vintage.
+  TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Verify the tag matches the crate version
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          crate_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [ "$tag_version" != "$crate_version" ]; then
+            echo "tag ${GITHUB_REF_NAME} implies version ${tag_version}, but Cargo.toml says ${crate_version}" >&2
+            exit 1
+          fi
+
+      - name: Install the musl toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add "$TARGET"
+
+      - name: Build the CLI
+        run: cargo build --release --locked --bin dush --target "$TARGET"
+
+      - name: Strip the binary
+        run: strip "target/$TARGET/release/dush"
+
+      - name: Package the tarball
+        run: |
+          set -euo pipefail
+          stem="dush-${GITHUB_REF_NAME}-${TARGET}"
+          mkdir -p "dist/$stem"
+          cp "target/$TARGET/release/dush" LICENSE README.md "dist/$stem/"
+          tar -czf "dist/$stem.tar.gz" -C dist "$stem"
+          # Checksum recorded with a bare filename so `sha256sum -c` works
+          # from whatever directory the user unpacks into.
+          (cd dist && sha256sum "$stem.tar.gz" > "$stem.tar.gz.sha256")
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # A re-run of this workflow has to converge on the same release
+          # instead of failing because `create` found one already there.
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes dist/*.tar.gz*
+          fi
