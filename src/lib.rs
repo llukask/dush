@@ -55,10 +55,25 @@ pub enum AnalysisError {
     /// A path could not be `stat`ed — typically because it disappeared
     /// between `read_dir` and `symlink_metadata`, or the caller lacks
     /// permission to read its parent directory's metadata.
-    NoMetadata(PathBuf),
+    NoMetadata(#[serde(serialize_with = "serialize_path_lossy")] PathBuf),
     /// A directory could not be enumerated — typically a permissions
     /// problem or a filesystem-level read error.
-    CouldNotReadDir(PathBuf),
+    CouldNotReadDir(#[serde(serialize_with = "serialize_path_lossy")] PathBuf),
+}
+
+/// Serialize a path as a UTF-8 string, replacing invalid sequences with
+/// U+FFFD.
+///
+/// serde's built-in `Path` impl returns an error for paths that aren't
+/// valid UTF-8, which would let a single oddly-named file abort an entire
+/// JSON export. Unix filenames are arbitrary bytes, so such paths do show
+/// up in the wild. Lossy conversion matches how [`Entry::name`] is already
+/// derived, so `name` and `path` stay consistent with each other.
+fn serialize_path_lossy<S: serde::Serializer>(
+    path: &Path,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_str(&path.to_string_lossy())
 }
 
 impl AnalysisError {
@@ -91,7 +106,9 @@ impl From<&diskus::Error> for AnalysisError {
 /// number of bytes attributed to its subtree.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Entry {
-    /// The full path of this entry.
+    /// The full path of this entry. Serialized lossily as UTF-8; see
+    /// `serialize_path_lossy`.
+    #[serde(serialize_with = "serialize_path_lossy")]
     pub path: PathBuf,
     /// The file or directory name (last path component).
     pub name: String,
@@ -139,6 +156,7 @@ pub enum Progress<'a> {
 /// rendering code trivial.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Analysis {
+    #[serde(serialize_with = "serialize_path_lossy")]
     root: PathBuf,
     total_in_bytes: u64,
     entries: Vec<Entry>,
@@ -540,6 +558,38 @@ mod tests {
             mentions,
             "errors should reference the restricted path: {:?}",
             analysis.errors()
+        );
+    }
+
+    /// Regression: serde's stock `Path` serializer rejects non-UTF-8
+    /// paths, which used to make `dush -f json` fail mid-document as soon
+    /// as the analyzed directory contained such a filename.
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_paths_serialize_lossily() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let bad_name = OsStr::from_bytes(b"bad\xffname");
+        write_file(&tmp.path().join(bad_name), 10);
+
+        let analysis = analyze(tmp.path(), &AnalyzeOptions::default()).expect("analyze");
+        let json = serde_json::to_value(&analysis).expect("serialize to JSON");
+
+        let entry = &json["entries"][0];
+        assert_eq!(entry["name"], "bad\u{FFFD}name");
+        let path = entry["path"].as_str().expect("path is a string");
+        assert!(path.ends_with("/bad\u{FFFD}name"), "path: {path}");
+
+        // Errors carry paths too and must not trip over the same thing.
+        let err = AnalysisError::CouldNotReadDir(tmp.path().join(bad_name));
+        let err_json = serde_json::to_value(&err).expect("serialize error");
+        assert_eq!(err_json["kind"], "could_not_read_dir");
+        assert!(
+            err_json["path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with("/bad\u{FFFD}name"))
         );
     }
 
