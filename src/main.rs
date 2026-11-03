@@ -17,7 +17,7 @@
 //!   5.0 GiB  total
 //! ```
 
-use std::io::{IsTerminal, Write};
+use std::io::{ErrorKind, IsTerminal, Write};
 use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
@@ -103,14 +103,41 @@ fn main() -> Result<()> {
 
     let levels = cli.levels.max(1);
 
+    // Render the whole report into memory, then hand it to stdout in one
+    // write. Two benefits: a serialization failure can never leave a
+    // half-written document (e.g. truncated JSON) on stdout, and there is
+    // exactly one place that has to cope with the reader going away.
+    let mut out: Vec<u8> = Vec::new();
     match cli.format {
-        OutputFormat::Pretty => print_report(&analysis, top, levels, &opts),
-        OutputFormat::Text => render_text(&analysis, top),
-        OutputFormat::Csv => render_delimited(&analysis, b',')?,
-        OutputFormat::Tsv => render_delimited(&analysis, b'\t')?,
-        OutputFormat::Json => render_json(&analysis)?,
+        OutputFormat::Pretty => render_pretty(&mut out, &analysis, top, levels, &opts)?,
+        OutputFormat::Text => render_text(&mut out, &analysis, top)?,
+        OutputFormat::Csv => render_delimited(&mut out, &analysis, b',')?,
+        OutputFormat::Tsv => render_delimited(&mut out, &analysis, b'\t')?,
+        OutputFormat::Json => render_json(&mut out, &analysis)?,
+    }
+    write_stdout(&out)?;
+
+    // Warnings go to stderr *after* the report so they appear below it
+    // when both streams share a terminal.
+    if matches!(cli.format, OutputFormat::Pretty) {
+        print_warnings(&analysis);
     }
     Ok(())
+}
+
+/// Write the rendered report to stdout.
+///
+/// A closed pipe (`dush | head -1`) is not an error from the user's point
+/// of view — the consumer simply has all it wanted — so `BrokenPipe` is
+/// swallowed instead of surfacing as a panic or an error report. Rust
+/// ignores `SIGPIPE` by default, which is why this has to be handled
+/// explicitly rather than letting the signal terminate the process.
+fn write_stdout(buf: &[u8]) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    match stdout.write_all(buf).and_then(|()| stdout.flush()) {
+        Err(e) if e.kind() == ErrorKind::BrokenPipe => Ok(()),
+        other => other.context("while writing to stdout"),
+    }
 }
 
 // ==============================================================================
@@ -284,11 +311,17 @@ struct RenderRow {
     depth: usize,
 }
 
-/// Print the full report. With `levels == 1` this is a flat top-N
+/// Render the full report. With `levels == 1` this is a flat top-N
 /// listing; with higher values we recursively analyze each top-N
 /// directory and indent its top-N children underneath, drawing standard
 /// `tree(1)`-style connectors so the structure is obvious.
-fn print_report(analysis: &Analysis, top: Option<usize>, levels: usize, opts: &AnalyzeOptions) {
+fn render_pretty(
+    out: &mut impl Write,
+    analysis: &Analysis,
+    top: Option<usize>,
+    levels: usize,
+    opts: &AnalyzeOptions,
+) -> std::io::Result<()> {
     // Collect every row we plan to print up front. Two reasons:
     //
     // 1. The size column is right-aligned to the widest size string we
@@ -300,8 +333,12 @@ fn print_report(analysis: &Analysis, top: Option<usize>, levels: usize, opts: &A
     collect_rows(analysis, top, levels, opts, "", 0, &mut rows);
 
     if rows.is_empty() {
-        println!("(empty: {} contains no entries)", analysis.root().display());
-        return;
+        writeln!(
+            out,
+            "(empty: {} contains no entries)",
+            analysis.root().display()
+        )?;
+        return Ok(());
     }
 
     let use_color = pretty_use_color();
@@ -317,7 +354,8 @@ fn print_report(analysis: &Analysis, top: Option<usize>, levels: usize, opts: &A
 
     // Header. The column widths match the per-row layout below so the
     // labels line up over their data.
-    println!(
+    writeln!(
+        out,
         "  {size:>width$}   {bar:<bar_width$}   {pct:>6}   name",
         size = "size",
         width = size_col_width,
@@ -326,7 +364,7 @@ fn print_report(analysis: &Analysis, top: Option<usize>, levels: usize, opts: &A
         // visual width is `BAR_WIDTH + 2`.
         bar_width = BAR_WIDTH + 2,
         pct = "  pct",
-    );
+    )?;
 
     for (row, size_str) in rows.iter().zip(size_strs.iter()) {
         let bar = render_bar(row.size_in_bytes, row.level_total, BAR_WIDTH);
@@ -344,7 +382,8 @@ fn print_report(analysis: &Analysis, top: Option<usize>, levels: usize, opts: &A
         // the eye can track levels visually. The name itself stays in
         // the default foreground for readability.
         let (col_open, col_close) = ansi_color(row.depth, use_color);
-        println!(
+        writeln!(
+            out,
             "{c0}{marker}{c1} {size:>width$}   {c0}{bar}{c1}   {pct:>5.1}%   {c0}{prefix}{c1}{name}{suffix}",
             c0 = col_open,
             c1 = col_close,
@@ -356,7 +395,7 @@ fn print_report(analysis: &Analysis, top: Option<usize>, levels: usize, opts: &A
             prefix = row.line_prefix,
             name = row.name,
             suffix = suffix,
-        );
+        )?;
     }
 
     // Total row: a heavy box-drawing rule (U+2501) under the size column,
@@ -366,17 +405,16 @@ fn print_report(analysis: &Analysis, top: Option<usize>, levels: usize, opts: &A
     let total = analysis.total_in_bytes();
     let total_str = format_size(total, BINARY);
     let separator_width = size_col_width.max(total_str.len());
-    println!("  {}", "━".repeat(separator_width));
+    writeln!(out, "  {}", "━".repeat(separator_width))?;
     let truncated = top.is_some_and(|n| n < analysis.entries().len()) || levels > 1;
     let label = if truncated { "total (root)" } else { "total" };
-    println!(
+    writeln!(
+        out,
         "Σ {:>width$}   {}",
         total_str,
         label,
         width = separator_width
-    );
-
-    print_warnings(analysis);
+    )
 }
 
 /// Recursively gather rows for the pretty report. Top-N truncation
@@ -469,7 +507,7 @@ fn print_warnings(analysis: &Analysis) {
 // Plain text output
 // ==============================================================================
 
-/// Write a no-frills three-column listing to stdout: raw byte count,
+/// Write a no-frills three-column listing to `out`: raw byte count,
 /// human-readable size, then the entry name with a trailing slash for
 /// directories.
 ///
@@ -484,7 +522,11 @@ fn print_warnings(analysis: &Analysis) {
 /// (`974.79MiB` rather than `974.79 MiB`) so each row stays a clean
 /// 3-field record under awk's default whitespace splitting:
 /// `$1 = bytes, $2 = human, $3 = name`.
-fn render_text(analysis: &Analysis, top: Option<usize>) {
+fn render_text(
+    out: &mut impl Write,
+    analysis: &Analysis,
+    top: Option<usize>,
+) -> std::io::Result<()> {
     let visible: &[Entry] = match top {
         Some(n) => &analysis.entries()[..analysis.entries().len().min(n)],
         None => analysis.entries(),
@@ -510,20 +552,22 @@ fn render_text(analysis: &Analysis, top: Option<usize>) {
         visible.iter().zip(bytes_strs.iter()).zip(human_strs.iter())
     {
         let suffix = if entry.is_dir { "/" } else { "" };
-        println!(
+        writeln!(
+            out,
             "{bytes_str:>bw$}  {human_str:>hw$}  {name}{suffix}",
             bw = bytes_width,
             hw = human_width,
             name = entry.name,
-        );
+        )?;
     }
+    Ok(())
 }
 
 // ==============================================================================
 // Machine-readable output formats
 // ==============================================================================
 
-/// Write a CSV/TSV table to stdout.
+/// Write a CSV/TSV table to `out`.
 ///
 /// We share a single function for CSV and TSV since they only differ in
 /// their delimiter — and the `csv` crate already handles the awkward
@@ -534,11 +578,10 @@ fn render_text(analysis: &Analysis, top: Option<usize>) {
 /// tabular formats: they have a different shape (no size, no rank) and
 /// mixing them in would force every consumer to filter. Use `--format
 /// json` if you need errors alongside entries.
-fn render_delimited(analysis: &Analysis, delimiter: u8) -> Result<()> {
-    let stdout = std::io::stdout().lock();
+fn render_delimited(out: &mut impl Write, analysis: &Analysis, delimiter: u8) -> Result<()> {
     let mut writer = csv::WriterBuilder::new()
         .delimiter(delimiter)
-        .from_writer(stdout);
+        .from_writer(out);
 
     // Header row. `size_human` is the binary-suffix string we'd render in
     // text mode, included because it is much easier to skim than raw bytes
@@ -582,7 +625,7 @@ fn render_delimited(analysis: &Analysis, delimiter: u8) -> Result<()> {
     Ok(())
 }
 
-/// Write the analysis as pretty-printed JSON to stdout.
+/// Write the analysis as pretty-printed JSON to `out`.
 ///
 /// We serialize the `Analysis` struct directly — its serde derive produces
 /// `{root, total_in_bytes, entries: [...], errors: [...]}` which is the
@@ -590,10 +633,9 @@ fn render_delimited(analysis: &Analysis, delimiter: u8) -> Result<()> {
 /// because the output is short enough that compactness is not a concern,
 /// and a human glancing at the result is the more common case than a tight
 /// machine-to-machine pipeline.
-fn render_json(analysis: &Analysis) -> Result<()> {
-    let stdout = std::io::stdout().lock();
-    serde_json::to_writer_pretty(stdout, analysis).context("while writing JSON output")?;
-    println!();
+fn render_json(out: &mut impl Write, analysis: &Analysis) -> Result<()> {
+    serde_json::to_writer_pretty(&mut *out, analysis).context("while writing JSON output")?;
+    writeln!(out)?;
     Ok(())
 }
 
