@@ -25,16 +25,11 @@ dush -a ~/dev         # apparent size, like `du --apparent-size`
 dush -f json ~/dev    # machine-readable output (csv, tsv, json, text)
 ```
 
-GUI (requires the `gui` feature and GTK4 system libs — see below):
-
-```text
-cargo run --release --features gui --bin dush-gui -- ~/dev
-```
-
-There is also a [gpui](https://gpui.rs) GUI, `dush-gpui`. It shows the
-same data as a tree you can explore with the mouse or the keyboard:
-arrows or `hjkl` to move, expand and collapse, `enter` to toggle, `q`
-to quit. Directory sizes fill in while you browse.
+`dush-gpui` is a [gpui](https://gpui.rs) GUI that shows the same data as
+a tree you can explore with the mouse or the keyboard: arrows or `hjkl`
+to move, expand and collapse, `enter` to toggle, `q` to quit. Directory
+sizes fill in while you browse. It needs the `gpui` feature and a few
+system libraries, see below.
 
 ```text
 cargo run --release --features gpui --bin dush-gpui -- ~/dev
@@ -50,8 +45,7 @@ On my machine `du -sh /*` runs in ~4m1s, `dush /` runs in ~16s.
 
 ```text
 cargo install --path .              # CLI only
-cargo install --path . --features gui   # CLI + GTK GUI
-cargo install --path . --features gpui  # CLI + gpui GUI
+cargo install --path . --features gpui  # CLI + GUI
 ```
 
 ## Requirements
@@ -59,13 +53,10 @@ cargo install --path . --features gpui  # CLI + gpui GUI
 - Rust **1.85+** (edition 2024).
 - Linux, macOS, or any Unix where `diskus` works. The CLI is pure Rust
   and has no system dependencies.
-- The GUI binary additionally requires GTK4 ≥ 4.10 system libraries:
-  `gtk4`, `glib`, `gdk-pixbuf`, `graphene`, `cairo`, `pango`, `librsvg`,
-  plus `pkg-config` at build time. On NixOS, `nix develop` in this repo
-  drops you into a shell that has them all.
-- The gpui binary needs `libxkbcommon` and `libxcb` to build, and a
-  Vulkan driver plus Wayland or X11 at runtime. `nix develop` covers
-  this too.
+- The GUI binary needs `libxkbcommon` and `libxcb` (plus `pkg-config`)
+  to build, and a Vulkan driver plus Wayland or X11 at runtime. On
+  NixOS, `nix develop` in this repo drops you into a shell that has
+  them all.
 
 ## License
 

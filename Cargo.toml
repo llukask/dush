@@ -4,31 +4,25 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
-description = "Faster `du -sh *` using diskus, with an optional GTK4 GUI."
+description = "Faster `du -sh *` using diskus, with an optional GUI for exploring disk usage."
 readme = "README.md"
-keywords = ["disk-usage", "du", "filesystem", "cli", "gtk4"]
+keywords = ["disk-usage", "du", "filesystem", "cli", "gui"]
 categories = ["command-line-utilities", "filesystem"]
 
 [features]
-# Enables the GTK4 GUI binary. Off by default so a plain `cargo build`
-# only requires the CLI's pure-Rust dependencies — GTK requires system
-# libraries (gtk4, glib, cairo, pango, ...) that aren't present on a
-# stock Linux box without an explicit dev environment. The included
+# Enables the gpui GUI binary. Off by default so a plain `cargo build`
+# only needs the CLI's pure-Rust dependencies: gpui links xkbcommon/xcb
+# and dlopens Wayland, Vulkan and fontconfig at runtime, none of which
+# a stock Linux box has without a dev environment. The included
 # `flake.nix` provides one.
-gui = ["dep:gtk", "dep:async-channel"]
-# Enables the gpui GUI binary. Off by default for the same reason as
-# `gui`: gpui links xkbcommon/xcb and dlopens Wayland, Vulkan and
-# fontconfig at runtime, none of which a CLI-only build should need.
 gpui = ["dep:gpui"]
 
 [dependencies]
-async-channel = { version = "2.5.0", optional = true }
 clap = { version = "4.6.1", features = ["derive"] }
 color-eyre = "0.6.5"
 csv = "1.4.0"
 diskus = "0.9.0"
 gpui = { version = "0.2.2", optional = true }
-gtk = { version = "0.11.3", package = "gtk4", features = ["v4_10"], optional = true }
 humansize = "2.1.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
@@ -38,16 +32,11 @@ libc = "0.2.186"
 tempfile = "3.27.0"
 
 # Explicit bin entries so we can attach `required-features` to the GUI:
-# without it, `cargo build` on a machine without GTK system libs would
+# without it, `cargo build` on a machine without gpui's system libs would
 # fail to build the GUI bin even though the user only asked for the CLI.
 [[bin]]
 name = "dush"
 path = "src/main.rs"
-
-[[bin]]
-name = "dush-gui"
-path = "src/bin/dush-gui.rs"
-required-features = ["gui"]
 
 [[bin]]
 name = "dush-gpui"

@@ -1,11 +1,12 @@
 name: release
 
 # Only the CLI binary `dush` is published here, and only for x86_64 Linux.
-# `dush-gui` is left out on purpose: it links GTK4 dynamically against
-# system libraries, so there is no tarball we could hand out that runs on
-# an arbitrary distro. Nix users get the GUI via `nix run .#dush-gui`.
-# TODO: if GUI distribution is ever wanted, Flatpak (or a similar bundle
-# format that ships the GTK stack) is the right vehicle, not this workflow.
+# `dush-gpui` is left out: it dlopens Vulkan, Wayland and fontconfig from
+# the host, which rules out the static musl build used here. Nix users get
+# the GUI via `nix run .#dush-gpui`.
+# TODO: if GUI distribution is ever wanted, a glibc tarball that relies
+# on the host's graphics stack (the way Zed ships) or a Flatpak would be
+# the vehicle, not this musl job.
 # TODO: an aarch64 build would be a second matrix entry on an
 # `ubuntu-24.04-arm` runner if demand shows up.
 
