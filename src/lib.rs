@@ -350,6 +350,25 @@ pub fn subtree_size<P: AsRef<Path>>(path: P, opts: &AnalyzeOptions) -> (u64, Vec
 /// instantly: the user sees the layout immediately, while the (slow)
 /// per-directory totals stream in afterwards.
 pub fn enumerate_children<P: AsRef<Path>>(root: P) -> Result<Vec<Entry>> {
+    enumerate_children_with(
+        root,
+        &AnalyzeOptions {
+            apparent_size: true,
+        },
+    )
+}
+
+/// Like [`enumerate_children`], but sizes files according to `opts`.
+///
+/// With `apparent_size` off, a file's size is the space its allocated
+/// blocks occupy, the same number [`subtree_size`] would report for it.
+/// This matters for sparse files: a VM image that claims 64 GiB but has
+/// only 3 GiB of blocks allocated shows up as 3 GiB, which is what a
+/// "where did my disk go?" view has to show.
+pub fn enumerate_children_with<P: AsRef<Path>>(
+    root: P,
+    opts: &AnalyzeOptions,
+) -> Result<Vec<Entry>> {
     let root = root.as_ref();
     let canonical = fs::canonicalize(root)
         .with_context(|| format!("while resolving root path {}", root.display()))?;
@@ -374,11 +393,14 @@ pub fn enumerate_children<P: AsRef<Path>>(root: P) -> Result<Vec<Entry>> {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
         // For directories we report 0 bytes — the eventual recursive
-        // total replaces this when [`subtree_size`] finishes. For files
-        // we use the metadata length, which is the apparent size; for
-        // disk-usage display this is a small undercount that stays put
-        // because regular files have no children to summarize over.
-        let size_in_bytes = if is_dir { 0 } else { metadata.len() };
+        // total replaces this when [`subtree_size`] finishes. Files get
+        // their final size right here, so callers never need to walk
+        // them.
+        let size_in_bytes = if is_dir {
+            0
+        } else {
+            file_size(&metadata, opts)
+        };
         out.push(Entry {
             path,
             name,
@@ -388,6 +410,25 @@ pub fn enumerate_children<P: AsRef<Path>>(root: P) -> Result<Vec<Entry>> {
     }
 
     Ok(out)
+}
+
+/// Size of a single non-directory entry under `opts`.
+///
+/// Uses the same block arithmetic as `diskus` (`st_blocks` counts
+/// 512-byte units regardless of the filesystem's block size), so the
+/// result agrees with [`subtree_size`] without paying for a `diskus` walk,
+/// which spins up a thread pool per call.
+fn file_size(metadata: &fs::Metadata, opts: &AnalyzeOptions) -> u64 {
+    #[cfg(unix)]
+    if !opts.apparent_size {
+        use std::os::unix::fs::MetadataExt;
+        return metadata.blocks() * 512;
+    }
+    // On Windows `diskus` reports the apparent size for disk usage as
+    // well, so falling through to `len()` keeps the two consistent.
+    #[cfg(not(unix))]
+    let _ = opts;
+    metadata.len()
 }
 
 // ==============================================================================
@@ -591,6 +632,34 @@ mod tests {
                 .as_str()
                 .is_some_and(|p| p.ends_with("/bad\u{FFFD}name"))
         );
+    }
+
+    /// A sparse file has to show its allocated size in disk-usage mode,
+    /// and that number must agree with what `diskus` reports for it.
+    #[cfg(unix)]
+    #[test]
+    fn enumerate_children_with_sizes_sparse_files_by_blocks() {
+        let tmp = TempDir::new().expect("tempdir");
+        let sparse = tmp.path().join("sparse.img");
+        File::create(&sparse)
+            .expect("create sparse file")
+            .set_len(16 * 1024 * 1024)
+            .expect("extend sparse file");
+
+        let disk_usage = AnalyzeOptions::default();
+        let apparent = AnalyzeOptions {
+            apparent_size: true,
+        };
+
+        let by_blocks = enumerate_children_with(tmp.path(), &disk_usage).expect("enumerate");
+        let by_len = enumerate_children_with(tmp.path(), &apparent).expect("enumerate");
+
+        assert_eq!(by_len[0].size_in_bytes, 16 * 1024 * 1024);
+        assert_eq!(
+            by_blocks[0].size_in_bytes,
+            subtree_size(&sparse, &disk_usage).0
+        );
+        assert!(by_blocks[0].size_in_bytes < by_len[0].size_in_bytes);
     }
 
     #[test]
