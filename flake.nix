@@ -52,34 +52,38 @@
           };
         };
 
-        # GUI build. No wrapper hook is needed, but the dlopened
-        # libraries in `gpuiLibs` are invisible to the linker, so the
-        # fixup phase's rpath shrinking would drop them. We add them
-        # back afterwards in `postFixup`.
-        dush-gpui = pkgs.rustPlatform.buildRustPackage {
-          pname = "dush-gpui";
+        # GUI builds. Both GUIs need the same system libraries, so one
+        # builder serves both. No wrapper hook is needed, but the
+        # dlopened libraries in `gpuiLibs` are invisible to the linker,
+        # so the fixup phase's rpath shrinking would drop them. We add
+        # them back afterwards in `postFixup`.
+        mkGui = { pname, feature, flavor }: pkgs.rustPlatform.buildRustPackage {
+          inherit pname;
           version = cargoToml.package.version;
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
-          buildFeatures = [ "gpui" ];
-          cargoBuildFlags = [ "--bin" "dush-gpui" ];
+          buildFeatures = [ feature ];
+          cargoBuildFlags = [ "--bin" pname ];
           nativeBuildInputs = with pkgs; [ pkg-config ];
           buildInputs = gpuiLibs;
           # `cargo test` also runs the library tests; keep it on so we
           # don't silently regress them.
           doCheck = true;
           postFixup = ''
-            patchelf --add-rpath ${pkgs.lib.makeLibraryPath gpuiLibs} $out/bin/dush-gpui
+            patchelf --add-rpath ${pkgs.lib.makeLibraryPath gpuiLibs} $out/bin/${pname}
           '';
           meta = {
-            description = cargoToml.package.description + " (gpui GUI)";
+            description = cargoToml.package.description + " (${flavor} GUI)";
             license = pkgs.lib.licenses.mit;
-            mainProgram = "dush-gpui";
+            mainProgram = pname;
           };
         };
+
+        dush-gpui = mkGui { pname = "dush-gpui"; feature = "gpui"; flavor = "gpui"; };
+        dush-kit = mkGui { pname = "dush-kit"; feature = "gpui-kit"; flavor = "GPUI Kit"; };
       in {
         packages = {
-          inherit dush dush-gpui;
+          inherit dush dush-gpui dush-kit;
           default = dush;
         };
 
@@ -98,6 +102,10 @@
           dush-gpui = {
             type = "app";
             program = "${dush-gpui}/bin/dush-gpui";
+          };
+          dush-kit = {
+            type = "app";
+            program = "${dush-kit}/bin/dush-kit";
           };
         };
 
