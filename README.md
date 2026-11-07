@@ -31,6 +31,17 @@ GUI (requires the `gui` feature and GTK4 system libs — see below):
 cargo run --release --features gui --bin dush-gui -- ~/dev
 ```
 
+There is also a [gpui](https://gpui.rs) GUI, `dush-gpui`. It shows the
+same data as a tree you can explore with the mouse or the keyboard:
+arrows or `hjkl` to move, expand and collapse, `enter` to toggle, `q`
+to quit. Directory sizes fill in while you browse.
+
+```text
+cargo run --release --features gpui --bin dush-gpui -- ~/dev
+cargo run --release --features gpui --bin dush-gpui -- -a ~/dev   # apparent size
+nix run .#dush-gpui -- ~/dev
+```
+
 ## Performance
 
 On my machine `du -sh /*` runs in ~4m1s, `dush /` runs in ~16s.
@@ -39,7 +50,8 @@ On my machine `du -sh /*` runs in ~4m1s, `dush /` runs in ~16s.
 
 ```text
 cargo install --path .              # CLI only
-cargo install --path . --features gui   # CLI + GUI
+cargo install --path . --features gui   # CLI + GTK GUI
+cargo install --path . --features gpui  # CLI + gpui GUI
 ```
 
 ## Requirements
@@ -51,6 +63,9 @@ cargo install --path . --features gui   # CLI + GUI
   `gtk4`, `glib`, `gdk-pixbuf`, `graphene`, `cairo`, `pango`, `librsvg`,
   plus `pkg-config` at build time. On NixOS, `nix develop` in this repo
   drops you into a shell that has them all.
+- The gpui binary needs `libxkbcommon` and `libxcb` to build, and a
+  Vulkan driver plus Wayland or X11 at runtime. `nix develop` covers
+  this too.
 
 ## License
 

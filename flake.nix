@@ -26,6 +26,21 @@
           librsvg
         ];
 
+        # Libraries the gpui stack needs. `libxkbcommon` and `libxcb`
+        # are linked at build time; the rest are dlopened at runtime
+        # (Wayland and Vulkan by the blade renderer, fontconfig by
+        # font-kit), so they also have to end up on the binary's rpath
+        # or on LD_LIBRARY_PATH in the dev shell.
+        gpuiLibs = with pkgs; [
+          libxkbcommon
+          libxcb
+          libx11
+          wayland
+          vulkan-loader
+          fontconfig
+          freetype
+        ];
+
         # CLI build: pure Rust, no system libs required. We disable
         # default features explicitly to be defensive in case `gui` ever
         # becomes default.
@@ -70,9 +85,33 @@
             mainProgram = "dush-gui";
           };
         };
+
+        # gpui GUI build. No wrapper hook is needed, but the dlopened
+        # libraries in `gpuiLibs` are invisible to the linker, so the
+        # fixup phase's rpath shrinking would drop them. We add them
+        # back afterwards in `postFixup`.
+        dush-gpui = pkgs.rustPlatform.buildRustPackage {
+          pname = "dush-gpui";
+          version = cargoToml.package.version;
+          src = ./.;
+          cargoLock.lockFile = ./Cargo.lock;
+          buildFeatures = [ "gpui" ];
+          cargoBuildFlags = [ "--bin" "dush-gpui" ];
+          nativeBuildInputs = with pkgs; [ pkg-config ];
+          buildInputs = gpuiLibs;
+          doCheck = true;
+          postFixup = ''
+            patchelf --add-rpath ${pkgs.lib.makeLibraryPath gpuiLibs} $out/bin/dush-gpui
+          '';
+          meta = {
+            description = cargoToml.package.description + " (gpui GUI)";
+            license = pkgs.lib.licenses.mit;
+            mainProgram = "dush-gpui";
+          };
+        };
       in {
         packages = {
-          inherit dush dush-gui;
+          inherit dush dush-gui dush-gpui;
           default = dush;
         };
 
@@ -91,6 +130,10 @@
           dush-gui = {
             type = "app";
             program = "${dush-gui}/bin/dush-gui";
+          };
+          dush-gpui = {
+            type = "app";
+            program = "${dush-gpui}/bin/dush-gpui";
           };
         };
 
@@ -112,7 +155,11 @@
           # links against, kept in `gtkLibs` above so the two don't
           # drift. gtk4-rs (and its glib/gdk/cairo/pango sister crates)
           # all use pkg-config to find these.
-          buildInputs = gtkLibs;
+          buildInputs = gtkLibs ++ gpuiLibs;
+
+          # `cargo run --bin dush-gpui` has no rpath for the dlopened
+          # gpui libraries, so expose them the old-fashioned way.
+          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath gpuiLibs;
         };
       });
 }
