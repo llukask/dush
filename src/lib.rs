@@ -24,6 +24,8 @@ use std::path::{Path, PathBuf};
 use color_eyre::eyre::{Context, Result};
 use diskus::DiskUsage;
 
+pub mod tree;
+
 // ==============================================================================
 // Public types
 // ==============================================================================
