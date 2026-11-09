@@ -15,11 +15,11 @@
 //!
 //! ## Structure
 //!
-//! The model is [`dush::tree::Tree`], shared with `dush-kit`. This view
-//! keeps a flattened list of its visible rows, rebuilt at most once per
-//! frame after the tree changes, and hands it to
-//! gpui's `uniform_list`, which only lays out the rows on screen. That
-//! keeps a directory with 50k children as cheap to scroll as one with 5.
+//! The model is [`dush::tree::Tree`]. This view keeps a flattened list
+//! of its visible rows, rebuilt at most once per frame after the tree
+//! changes, and hands it to gpui's `uniform_list`, which only lays out
+//! the rows on screen. That keeps a directory with 50k children as cheap
+//! to scroll as one with 5.
 
 use std::ops::Range;
 use std::path::PathBuf;

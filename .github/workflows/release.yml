@@ -1,10 +1,9 @@
 name: release
 
 # Only the CLI binary `dush` is published here, and only for x86_64 Linux.
-# The GUIs (`dush-gpui`, `dush-kit`) are left out: they dlopen Vulkan,
-# Wayland and fontconfig from the host, which rules out the static musl
-# build used here. Nix users get them via `nix run .#dush-gpui` and
-# `nix run .#dush-kit`.
+# `dush-gpui` is left out: it dlopens Vulkan, Wayland and fontconfig from
+# the host, which rules out the static musl build used here. Nix users get
+# the GUI via `nix run .#dush-gpui`.
 # TODO: if GUI distribution is ever wanted, a glibc tarball that relies
 # on the host's graphics stack (the way Zed ships) or a Flatpak would be
 # the vehicle, not this musl job.

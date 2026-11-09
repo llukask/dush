@@ -37,16 +37,6 @@ cargo run --release --features gpui --bin dush-gpui -- -a ~/dev   # apparent siz
 nix run .#dush-gpui -- ~/dev
 ```
 
-`dush-kit` is the same explorer built from [GPUI Kit](https://gpui-kit.com)
-components: the kit's tree widget, progress bars, Lucide icons and
-themes. Keys are the kit's: arrows to move, expand and collapse, `enter`
-to toggle, `q` to quit.
-
-```text
-cargo run --release --features gpui-kit --bin dush-kit -- ~/dev
-nix run .#dush-kit -- ~/dev
-```
-
 ## Performance
 
 On my machine `du -sh /*` runs in ~4m1s, `dush /` runs in ~16s.
@@ -54,19 +44,17 @@ On my machine `du -sh /*` runs in ~4m1s, `dush /` runs in ~16s.
 ## Install
 
 ```text
-cargo install --path .                      # CLI only
-cargo install --path . --features gpui      # CLI + gpui GUI
-cargo install --path . --features gpui-kit  # CLI + GPUI Kit GUI
+cargo install --path .              # CLI only
+cargo install --path . --features gpui  # CLI + GUI
 ```
 
 ## Requirements
 
-- Rust **1.85+** (edition 2024) for the CLI. The GUIs want a recent
-  stable toolchain: `dush-kit` fails on 1.94 because GPUI Kit's gpui
-  uses `std::hint::cold_path`. The flake's toolchain (1.99) builds both.
+- Rust **1.85+** (edition 2024) for the CLI. `dush-gpui` wants a recent
+  stable toolchain. It's known to build on 1.94 and on the flake's 1.99.
 - Linux, macOS, or any Unix where `diskus` works. The CLI is pure Rust
   and has no system dependencies.
-- Both GUI binaries need `libxkbcommon` and `libxcb` (plus `pkg-config`)
+- The GUI binary needs `libxkbcommon` and `libxcb` (plus `pkg-config`)
   to build, and a Vulkan driver plus Wayland or X11 at runtime. On
   NixOS, `nix develop` in this repo drops you into a shell that has
   them all.
