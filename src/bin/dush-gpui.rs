@@ -10,8 +10,8 @@
 //!
 //! The window opens immediately with the root directory expanded. Its
 //! children show up as soon as `read_dir` returns, and directory sizes
-//! stream in afterwards from background `diskus` walks. Expanding a
-//! directory runs the same enumerate-then-size cycle one level down.
+//! stream in afterwards from background walks. Expanding a directory
+//! runs the same enumerate-then-size cycle one level down.
 //!
 //! ## Structure
 //!
@@ -328,15 +328,16 @@ impl DushView {
     /// subdirectories one at a time, publishing every result as it lands.
     ///
     /// The walks run one after another, not in parallel, because each
-    /// `diskus` walk already fans out across all cores; overlapping them
-    /// would only make every walk slower. Separate expansions do run
+    /// walk already fans out across all cores; overlapping them would
+    /// only make every walk slower. Separate expansions do run
     /// concurrently, so expanding a second directory while the first is
     /// still sizing doesn't queue behind it.
     ///
     /// TODO: every expansion walks the subdirectories again, although the
     /// parent's walk already visited all of them. The page cache makes
     /// the second pass cheap, but a single walk that records a total per
-    /// directory would skip it. `diskus` only reports one number per call.
+    /// directory would skip it. `subtree_size` only reports one number
+    /// per call.
     fn load(&mut self, id: NodeId, cx: &mut Context<Self>) {
         let path = self.tree.node(id).path.clone();
         let opts = self.opts;

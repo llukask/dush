@@ -3,11 +3,10 @@
 //! A library for analyzing disk space usage of a directory by computing
 //! the total recursive size of each of its immediate children.
 //!
-//! The heavy lifting — parallel directory traversal and (where supported)
-//! deduplication of files referenced by multiple hardlinks — is done by the
-//! [`diskus`] crate. `dush` composes that primitive into a per-child
-//! breakdown suitable for rendering as a "what is taking up space here?"
-//! report.
+//! One pool of worker threads walks all children at the same time. The
+//! numbers follow `du`: within a child, a file with several hardlinks
+//! counts once (where the platform exposes inode numbers), and directory
+//! inodes count toward disk usage but not toward apparent size.
 //!
 //! ```no_run
 //! use dush::{analyze, AnalyzeOptions};
@@ -20,9 +19,10 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, mpsc};
 
 use color_eyre::eyre::{Context, Result};
-use diskus::DiskUsage;
 
 pub mod tree;
 
@@ -32,10 +32,9 @@ pub mod tree;
 
 /// Options controlling how a directory is analyzed.
 ///
-/// Mirrors the subset of `diskus` knobs that are user-facing in our CLI. We
-/// intentionally do not expose worker-thread tuning here — the `diskus`
-/// default (3× CPU cores, capped at 64) is well-chosen for a tool that is
-/// invoked interactively.
+/// Worker-thread tuning is intentionally not exposed. The walker's
+/// default (3× CPU cores, see `pool`) suits a tool that is invoked
+/// interactively.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AnalyzeOptions {
     /// When `true`, count "apparent size" (bytes a file claims) rather than
@@ -45,9 +44,6 @@ pub struct AnalyzeOptions {
 
 /// A single inaccessible path encountered during traversal.
 ///
-/// Mirrors `diskus::Error` but lives in our public API so that callers
-/// don't need to depend on the `diskus` crate directly to render warnings.
-///
 /// The serde representation is tagged: `{"kind": "no_metadata", "path":
 /// "..."}`. We use `snake_case` for the variant tags so the JSON output
 /// looks like other unix-y tools.
@@ -55,8 +51,8 @@ pub struct AnalyzeOptions {
 #[serde(tag = "kind", content = "path", rename_all = "snake_case")]
 pub enum AnalysisError {
     /// A path could not be `stat`ed — typically because it disappeared
-    /// between `read_dir` and `symlink_metadata`, or the caller lacks
-    /// permission to read its parent directory's metadata.
+    /// between `read_dir` and the `stat`, or the caller lacks permission
+    /// to read its parent directory's metadata.
     NoMetadata(#[serde(serialize_with = "serialize_path_lossy")] PathBuf),
     /// A directory could not be enumerated — typically a permissions
     /// problem or a filesystem-level read error.
@@ -95,15 +91,6 @@ impl AnalysisError {
     }
 }
 
-impl From<&diskus::Error> for AnalysisError {
-    fn from(e: &diskus::Error) -> Self {
-        match e {
-            diskus::Error::NoMetadataForPath(p) => AnalysisError::NoMetadata(p.clone()),
-            diskus::Error::CouldNotReadDir(p) => AnalysisError::CouldNotReadDir(p.clone()),
-        }
-    }
-}
-
 /// A single child of the analyzed root directory, together with the total
 /// number of bytes attributed to its subtree.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -126,23 +113,20 @@ pub struct Entry {
 // `Analysis` types are produced by walking a live filesystem — there is no
 // reasonable round-trip from a serialized form back into a real analysis.
 
-/// Progress events emitted by [`analyze_with_progress`] as each immediate
-/// child of the root is processed.
+/// Progress events emitted by [`analyze_with_progress`].
+///
+/// Children are sized concurrently, so `Finished` events arrive in the
+/// order the walks complete, not in the order `read_dir` listed them.
 ///
 /// Borrowing the name avoids allocating a fresh `String` per event for what
 /// is almost always a transient `eprint!`-and-discard at the call site.
 #[derive(Debug)]
 pub enum Progress<'a> {
-    /// A child is about to be sized. `index` is 1-based; `total` is the
-    /// total number of immediate children discovered.
-    Started {
-        index: usize,
-        total: usize,
-        name: &'a str,
-    },
-    /// A child has been fully sized.
+    /// A child has been fully sized. `done` counts the children finished
+    /// so far, this one included; `total` is the number of children being
+    /// sized.
     Finished {
-        index: usize,
+        done: usize,
         total: usize,
         name: &'a str,
         size_in_bytes: u64,
@@ -173,7 +157,7 @@ impl Analysis {
 
     /// The sum of sizes of all immediate children.
     ///
-    /// This is *not* the same number `diskus` would report for the root
+    /// This is *not* the same number `du -s` would report for the root
     /// itself: it excludes the bytes consumed by the root directory inode,
     /// since we don't count the root in `entries`. For interactive use the
     /// difference is negligible, and using the children-sum keeps the
@@ -187,9 +171,9 @@ impl Analysis {
         &self.entries
     }
 
-    /// Paths that could not be accessed during traversal. These are
-    /// non-fatal: the entries above still have correct sizes for the
-    /// portion of the tree that *was* readable, and any unreadable
+    /// Paths that could not be accessed during traversal, sorted by path.
+    /// These are non-fatal: the entries above still have correct sizes for
+    /// the portion of the tree that *was* readable, and any unreadable
     /// subtrees simply contributed zero bytes to their parent's total.
     pub fn errors(&self) -> &[AnalysisError] {
         &self.errors
@@ -210,18 +194,12 @@ pub fn analyze<P: AsRef<Path>>(root: P, opts: &AnalyzeOptions) -> Result<Analysi
 }
 
 /// Analyze the given directory, invoking `on_progress` as each immediate
-/// child is enumerated and sized.
+/// child finishes.
 ///
-/// The traversal model is identical to [`analyze`]: each child is walked as
-/// its own `diskus::DiskUsage` job rather than walking the entire root in
-/// one pass. The latter would only give us a single total, while we want a
-/// per-child breakdown — so per-child walks are the natural fit. For
-/// typical roots (tens to low-hundreds of children) the bookkeeping
-/// overhead is dominated by the actual filesystem traversal.
-///
-/// Progress events are issued synchronously from the calling thread before
-/// and after each child is sized, plus a final [`Progress::Done`] once all
-/// children are processed.
+/// The calling thread lists the root, then the shared worker pool walks
+/// every child directory at the same time. `on_progress` runs on the
+/// calling thread: once per child as its walk completes, then a final
+/// [`Progress::Done`].
 pub fn analyze_with_progress<P, F>(
     root: P,
     opts: &AnalyzeOptions,
@@ -235,66 +213,78 @@ where
     let canonical = fs::canonicalize(root)
         .with_context(|| format!("while resolving root path {}", root.display()))?;
 
-    // Collect immediate children. We deliberately do not recurse here — that
-    // is `diskus`'s job, on a per-child basis below.
-    let mut children: Vec<PathBuf> = Vec::new();
+    // List the root before any walk starts. A root we can't read is the
+    // one failure that leaves nothing to report, so it is a hard error,
+    // unlike everything the walks run into below it.
+    let mut children: Vec<fs::DirEntry> = Vec::new();
     let read = fs::read_dir(&canonical)
         .with_context(|| format!("while reading directory {}", canonical.display()))?;
     for child in read {
-        let child = child.with_context(|| format!("while iterating {}", canonical.display()))?;
-        children.push(child.path());
+        children.push(child.with_context(|| format!("while iterating {}", canonical.display()))?);
     }
 
-    // Size each child. We size them sequentially because `diskus` itself is
-    // already heavily parallel internally — adding an outer rayon layer
-    // would mostly just contend on the same CPU cores.
-    let total = children.len();
-    let mut entries: Vec<Entry> = Vec::with_capacity(total);
-    let mut errors: Vec<AnalysisError> = Vec::new();
-    for (i, path) in children.into_iter().enumerate() {
-        let index = i + 1;
+    let walk = Walk::new(opts);
+    let mut entries: Vec<Entry> = Vec::with_capacity(children.len());
+    let (report, sizes) = mpsc::channel();
 
-        // We treat a `symlink_metadata` failure on an immediate child as a
-        // recoverable per-entry error rather than a hard `?`-style abort:
-        // a single broken/permission-denied entry shouldn't sink the
-        // entire report, which is the whole reason a user would run a disk
-        // analyzer in the first place.
-        let metadata = match path.symlink_metadata() {
-            Ok(m) => m,
-            Err(_) => {
-                errors.push(AnalysisError::NoMetadata(path.clone()));
+    // `in_place_scope` runs this closure on the calling thread, where
+    // `on_progress` has to be called, and sends only the spawned walks to
+    // the pool.
+    pool().in_place_scope(|scope| {
+        for child in children {
+            let path = child.path();
+            // We treat a `stat` failure on an immediate child as a
+            // recoverable per-entry error rather than a hard `?`-style
+            // abort: a single broken/permission-denied entry shouldn't
+            // sink the entire report, which is the whole reason a user
+            // would run a disk analyzer in the first place.
+            let Ok(metadata) = child.metadata() else {
+                walk.fail(AnalysisError::NoMetadata(path));
                 continue;
+            };
+            let is_dir = metadata.is_dir();
+            let name = path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+
+            // Each child gets its own tally, so a file hardlinked into
+            // two children counts in both, the same as running `du -s`
+            // on each of them.
+            let tally = Arc::new(Tally {
+                index: entries.len(),
+                bytes: AtomicU64::new(entry_size(&metadata, opts)),
+                hardlinks: Mutex::default(),
+                report: report.clone(),
+            });
+            if is_dir {
+                let (walk, path) = (&walk, path.clone());
+                scope.spawn(move |scope| walk_dir(scope, walk, path, tally));
             }
-        };
-        let is_dir = metadata.is_dir();
-        let name = path
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
+            // A file's tally has no other holder, so it drops at the end
+            // of this iteration and reports the file's own size.
+            entries.push(Entry {
+                path,
+                name,
+                size_in_bytes: 0,
+                is_dir,
+            });
+        }
 
-        on_progress(Progress::Started {
-            index,
-            total,
-            name: &name,
-        });
-
-        let (size_in_bytes, mut child_errors) = subtree_size(&path, opts);
-        errors.append(&mut child_errors);
-
-        on_progress(Progress::Finished {
-            index,
-            total,
-            name: &name,
-            size_in_bytes,
-        });
-
-        entries.push(Entry {
-            path,
-            name,
-            size_in_bytes,
-            is_dir,
-        });
-    }
+        // Only tallies hold senders from here on, so `sizes` ends when
+        // the last walk does.
+        drop(report);
+        let total = entries.len();
+        for (finished, (index, size_in_bytes)) in sizes.iter().enumerate() {
+            entries[index].size_in_bytes = size_in_bytes;
+            on_progress(Progress::Finished {
+                done: finished + 1,
+                total,
+                name: &entries[index].name,
+                size_in_bytes,
+            });
+        }
+    });
 
     on_progress(Progress::Done);
 
@@ -307,36 +297,44 @@ where
         root: canonical,
         total_in_bytes,
         entries,
-        errors,
+        errors: walk.into_errors(),
     })
 }
 
-/// Compute the recursive size of a single path by delegating to `diskus`,
-/// returning both the size in bytes and any per-path access errors that
-/// `diskus` accumulated while walking the subtree.
+/// Compute the recursive size of a single path, returning both the size
+/// in bytes and any per-path access errors hit while walking the subtree.
 ///
-/// For directories this runs a full parallel walk; for plain files
-/// `diskus` still does the work so that the apparent-size vs. disk-usage
-/// distinction is computed exactly the same way as for directory contents.
+/// Sizes follow `du`: directory inodes contribute to the disk-usage count
+/// but not to the apparent-size count, and a file with several hardlinks
+/// inside the subtree counts once. That keeps the numbers comparable to
+/// what `du -sh` / `du -sb --apparent-size` users already expect.
 ///
-/// Exposed publicly so a UI can size each child on its own background
-/// thread — the eager [`analyze`] path sizes everything serially before
-/// returning, which is fine for a CLI but makes the GUI feel sluggish at
-/// startup when the root has many large children.
+/// Exposed publicly so a UI can size each child as its own unit of
+/// background work and show every result as it lands. Calls from several
+/// threads share one worker pool, so they don't oversubscribe the CPU.
 pub fn subtree_size<P: AsRef<Path>>(path: P, opts: &AnalyzeOptions) -> (u64, Vec<AnalysisError>) {
-    // We deliberately leave `Directories` at its default `Auto`, which makes
-    // `diskus` mirror `du`'s behavior: directory inodes contribute to the
-    // disk-usage count but not to the apparent-size count. That keeps the
-    // numbers reported by dush comparable to what `du -sh` /
-    // `du -sb --apparent-size` users already expect.
-    let mut usage = DiskUsage::new([path.as_ref()]);
-    if opts.apparent_size {
-        usage = usage.apparent_size();
+    let path = path.as_ref();
+    let Ok(metadata) = path.symlink_metadata() else {
+        return (0, vec![AnalysisError::NoMetadata(path.to_path_buf())]);
+    };
+
+    let walk = Walk::new(opts);
+    let (report, sizes) = mpsc::channel();
+    let tally = Arc::new(Tally {
+        index: 0,
+        bytes: AtomicU64::new(entry_size(&metadata, opts)),
+        hardlinks: Mutex::default(),
+        report,
+    });
+    if metadata.is_dir() {
+        pool().scope(|scope| walk_dir(scope, &walk, path.to_path_buf(), tally));
+    } else {
+        drop(tally);
     }
-    let result = usage.count();
-    let errors: Vec<AnalysisError> = result.errors().iter().map(AnalysisError::from).collect();
-    let size = result.ignore_errors().size_in_bytes();
-    (size, errors)
+    let (_, size) = sizes
+        .recv()
+        .expect("every holder of the tally is gone, so it has reported");
+    (size, walk.into_errors())
 }
 
 /// Cheaply enumerate the immediate children of a directory without
@@ -385,7 +383,7 @@ pub fn enumerate_children_with<P: AsRef<Path>>(
         // later via [`subtree_size`]'s error channel if they end up
         // expanded. Aborting here would deny the user the view of the
         // *other* children just because of one denied sibling.
-        let metadata = match path.symlink_metadata() {
+        let metadata = match child.metadata() {
             Ok(m) => m,
             Err(_) => continue,
         };
@@ -401,7 +399,7 @@ pub fn enumerate_children_with<P: AsRef<Path>>(
         let size_in_bytes = if is_dir {
             0
         } else {
-            file_size(&metadata, opts)
+            entry_size(&metadata, opts)
         };
         out.push(Entry {
             path,
@@ -414,23 +412,196 @@ pub fn enumerate_children_with<P: AsRef<Path>>(
     Ok(out)
 }
 
-/// Size of a single non-directory entry under `opts`.
+// ==============================================================================
+// Walker
+// ==============================================================================
+
+/// The worker threads that every walk in the process shares.
 ///
-/// Uses the same block arithmetic as `diskus` (`st_blocks` counts
-/// 512-byte units regardless of the filesystem's block size), so the
-/// result agrees with [`subtree_size`] without paying for a `diskus` walk,
-/// which spins up a thread pool per call.
-fn file_size(metadata: &fs::Metadata, opts: &AnalyzeOptions) -> u64 {
+/// Sharing matters because starting a pool spawns each of its threads,
+/// which costs more than walking a small directory does. A root with
+/// 100k children would spend nearly all of its time starting threads if
+/// each child's walk brought its own.
+fn pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        // Three threads per core. Over a cold cache a walk spends its
+        // time blocked in `getdents` and `statx`, and the extra threads
+        // keep more requests queued at the disk. Over a warm cache they
+        // cost nothing we could measure. The 64-core cap bounds startup
+        // on very wide machines. `diskus` arrived at the same numbers:
+        // <https://github.com/sharkdp/diskus/issues/38#issuecomment-612772867>
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(3 * cores.min(64))
+            .thread_name(|i| format!("dush-walk-{i}"))
+            .build()
+            .expect("the OS lets a process start a few hundred threads")
+    })
+}
+
+/// Lock `mutex` whether or not it is poisoned.
+///
+/// The walker's locks guard `Vec`s that are only ever appended to, so a
+/// panic on another thread can't have left one half-updated.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// What all tasks of one walk share.
+#[derive(Debug)]
+struct Walk {
+    opts: AnalyzeOptions,
+    errors: Mutex<Vec<AnalysisError>>,
+}
+
+impl Walk {
+    fn new(opts: &AnalyzeOptions) -> Self {
+        Self {
+            opts: *opts,
+            errors: Mutex::default(),
+        }
+    }
+
+    fn fail(&self, error: AnalysisError) {
+        lock(&self.errors).push(error);
+    }
+
+    /// The recorded errors, sorted by path. Workers record them in
+    /// whatever order they race to, which would otherwise make the
+    /// warning list differ between two runs over the same tree.
+    fn into_errors(self) -> Vec<AnalysisError> {
+        let mut errors = self
+            .errors
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner);
+        errors.sort_by(|a, b| a.path().cmp(b.path()));
+        errors
+    }
+}
+
+/// Device and inode number, which together identify a file on Unix.
+type InodeId = (u64, u64);
+
+/// The running size of one subtree.
+///
+/// Every task that walks a directory of the subtree holds a handle to its
+/// tally. When the last of them drops its handle the subtree is complete,
+/// and `Drop` sends the final size through `report`. Completion falls out
+/// of ownership this way, with no task counter to keep in step with the
+/// spawns.
+#[derive(Debug)]
+struct Tally {
+    /// Which subtree this is. Sent back alongside the size.
+    index: usize,
+    /// Bytes of all entries that have a single name.
+    bytes: AtomicU64,
+    /// Size of each regular file that has several names. Such a file can
+    /// turn up in the subtree more than once but must count once, and
+    /// only the finished walk knows which sightings were repeats.
+    hardlinks: Mutex<Vec<(InodeId, u64)>>,
+    report: mpsc::Sender<(usize, u64)>,
+}
+
+impl Drop for Tally {
+    fn drop(&mut self) {
+        let hardlinks = self
+            .hardlinks
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        hardlinks.sort_unstable_by_key(|&(id, _)| id);
+        hardlinks.dedup_by_key(|&mut (id, _)| id);
+        let size = *self.bytes.get_mut() + hardlinks.iter().map(|&(_, bytes)| bytes).sum::<u64>();
+        // The receiver is only gone if the waiting thread unwound, and
+        // then nobody is left to want the size.
+        let _ = self.report.send((self.index, size));
+    }
+}
+
+/// Add everything directly inside `dir` to `tally`, and spawn a task that
+/// does the same for each subdirectory.
+///
+/// Sizes come from `DirEntry::metadata`, which on Unix is an `fstatat`
+/// relative to the open directory. The kernel resolves one path component
+/// per entry that way, where a `stat` of the full path would resolve
+/// every ancestor again.
+fn walk_dir<'scope>(
+    scope: &rayon::Scope<'scope>,
+    walk: &'scope Walk,
+    dir: PathBuf,
+    tally: Arc<Tally>,
+) {
+    let Ok(read) = fs::read_dir(&dir) else {
+        walk.fail(AnalysisError::CouldNotReadDir(dir));
+        return;
+    };
+
+    // Sum locally and touch the shared tally once per directory, so that
+    // threads walking the same subtree don't trade its cache line on
+    // every file.
+    let mut bytes = 0;
+    let mut hardlinks = Vec::new();
+    // `flatten` drops entries the kernel fails to hand over in the middle
+    // of a listing. There is no path to report for them.
+    for entry in read.flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            walk.fail(AnalysisError::NoMetadata(entry.path()));
+            continue;
+        };
+        let size = entry_size(&metadata, &walk.opts);
+        if metadata.is_dir() {
+            bytes += size;
+            let (path, tally) = (entry.path(), Arc::clone(&tally));
+            scope.spawn(move |scope| walk_dir(scope, walk, path, tally));
+        } else if let Some(id) = hardlink_id(&metadata) {
+            hardlinks.push((id, size));
+        } else {
+            bytes += size;
+        }
+    }
+
+    tally.bytes.fetch_add(bytes, Ordering::Relaxed);
+    if !hardlinks.is_empty() {
+        lock(&tally.hardlinks).append(&mut hardlinks);
+    }
+}
+
+/// Bytes that the entry behind `metadata` itself adds to a total under
+/// `opts`, not counting anything below it.
+///
+/// Disk usage is `st_blocks`, which counts 512-byte units regardless of
+/// the filesystem's block size. Apparent size is `len()` for everything
+/// but directories: a directory's `len()` describes its own listing, not
+/// the bytes stored in it, so `du --apparent-size` leaves it out and so
+/// do we.
+fn entry_size(metadata: &fs::Metadata, opts: &AnalyzeOptions) -> u64 {
     #[cfg(unix)]
     if !opts.apparent_size {
         use std::os::unix::fs::MetadataExt;
         return metadata.blocks() * 512;
     }
-    // On Windows `diskus` reports the apparent size for disk usage as
-    // well, so falling through to `len()` keeps the two consistent.
+    // Windows has no `st_blocks`, so the apparent size stands in for
+    // disk usage there.
     #[cfg(not(unix))]
     let _ = opts;
-    metadata.len()
+    if metadata.is_dir() { 0 } else { metadata.len() }
+}
+
+/// The identity of a regular file that has more than one name. `None`
+/// for everything else, which counts once per name.
+fn hardlink_id(metadata: &fs::Metadata) -> Option<InodeId> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.is_file() && metadata.nlink() > 1).then(|| (metadata.dev(), metadata.ino()))
+    }
+    // TODO: Windows has hardlinks too, but `std` has no stable way to
+    // read a file's index there, so every name counts.
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
 }
 
 // ==============================================================================
@@ -517,40 +688,97 @@ mod tests {
     }
 
     #[test]
-    fn progress_callback_emits_started_finished_done() {
+    fn progress_callback_emits_finished_per_child_then_done() {
         let tmp = TempDir::new().expect("tempdir");
         write_file(&tmp.path().join("a"), 100);
         write_file(&tmp.path().join("b"), 200);
 
         // We capture every event as a tag string so that ordering and
-        // counts can be asserted compactly. The exact order of children
-        // depends on `read_dir`, which is unspecified, so we only assert
-        // structural properties (paired Start/Finish per child, single
-        // terminal Done).
+        // counts can be asserted compactly. Children finish in whatever
+        // order their walks complete, so we assert the names as a set.
         let mut events: Vec<String> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
         analyze_with_progress(tmp.path(), &AnalyzeOptions::default(), |p| match p {
-            Progress::Started { index, total, name } => {
-                events.push(format!("S/{index}/{total}/{name}"));
-            }
             Progress::Finished {
-                index,
-                total,
-                name,
-                size_in_bytes,
+                done, total, name, ..
             } => {
-                events.push(format!("F/{index}/{total}/{name}/{size_in_bytes}"));
+                events.push(format!("F/{done}/{total}"));
+                names.push(name.to_string());
             }
             Progress::Done => events.push("D".into()),
         })
         .expect("analyze");
 
-        // Two children → 2 Started + 2 Finished + 1 Done = 5 events.
-        assert_eq!(events.len(), 5, "events: {events:?}");
-        assert_eq!(events.last().map(String::as_str), Some("D"));
-        let starts = events.iter().filter(|e| e.starts_with("S/")).count();
-        let finishes = events.iter().filter(|e| e.starts_with("F/")).count();
-        assert_eq!(starts, 2);
-        assert_eq!(finishes, 2);
+        assert_eq!(events, ["F/1/2", "F/2/2", "D"]);
+        names.sort();
+        assert_eq!(names, ["a", "b"]);
+    }
+
+    /// Two names for one file inside a child are one file's worth of
+    /// bytes. The same file linked into a second child counts there too,
+    /// because each child is sized as if `du -s` ran on it alone.
+    #[cfg(unix)]
+    #[test]
+    fn hardlinks_count_once_per_child() {
+        let tmp = TempDir::new().expect("tempdir");
+        let photos = tmp.path().join("photos");
+        let backup = tmp.path().join("backup");
+        std::fs::create_dir_all(photos.join("2024")).expect("mkdir photos");
+        std::fs::create_dir(&backup).expect("mkdir backup");
+        write_file(&photos.join("beach.jpg"), 5_000);
+        std::fs::hard_link(photos.join("beach.jpg"), photos.join("2024/beach.jpg"))
+            .expect("link within photos");
+        std::fs::hard_link(photos.join("beach.jpg"), backup.join("beach.jpg"))
+            .expect("link into backup");
+
+        let apparent = AnalyzeOptions {
+            apparent_size: true,
+        };
+        let analysis = analyze(tmp.path(), &apparent).expect("analyze");
+
+        let size_of = |name: &str| {
+            analysis
+                .entries()
+                .iter()
+                .find(|e| e.name == name)
+                .expect("entry present")
+                .size_in_bytes
+        };
+        assert_eq!(size_of("photos"), 5_000);
+        assert_eq!(size_of("backup"), 5_000);
+        assert_eq!(subtree_size(tmp.path(), &apparent).0, 5_000);
+    }
+
+    /// A child's size covers its whole subtree, however deep, and agrees
+    /// with `subtree_size` on the same path.
+    #[test]
+    fn deep_tree_aggregates_into_top_level_child() {
+        let tmp = TempDir::new().expect("tempdir");
+        let mut dir = tmp.path().join("projects");
+        for level in 0..20 {
+            dir.push(format!("level-{level}"));
+            std::fs::create_dir_all(&dir).expect("mkdir level");
+            write_file(&dir.join("notes.txt"), 100);
+            write_file(&dir.join("data.bin"), 1_000);
+        }
+
+        for opts in [
+            AnalyzeOptions::default(),
+            AnalyzeOptions {
+                apparent_size: true,
+            },
+        ] {
+            let analysis = analyze(tmp.path(), &opts).expect("analyze");
+            let projects = &analysis.entries()[0];
+            assert_eq!(projects.name, "projects");
+            assert_eq!(
+                projects.size_in_bytes,
+                subtree_size(&projects.path, &opts).0
+            );
+            if opts.apparent_size {
+                assert_eq!(projects.size_in_bytes, 20 * 1_100);
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -637,7 +865,7 @@ mod tests {
     }
 
     /// A sparse file has to show its allocated size in disk-usage mode,
-    /// and that number must agree with what `diskus` reports for it.
+    /// and that number must agree with what a walk reports for it.
     #[cfg(unix)]
     #[test]
     fn enumerate_children_with_sizes_sparse_files_by_blocks() {
