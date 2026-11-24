@@ -2,9 +2,9 @@
 //!
 //! Interactive disk-usage breakdown for a directory. Given a path, prints
 //! its immediate children sorted by size descending, with a unicode bar
-//! visualization and a percent-of-total column. Sizing uses the `diskus`
-//! crate via the `dush` library, so traversal is parallelized and
-//! hardlinks are deduplicated where the platform supports it.
+//! visualization and a percent-of-total column. Sizing goes through the
+//! `dush` library, so traversal is parallelized and hardlinks are
+//! deduplicated where the platform supports it.
 //!
 //! Example:
 //!
@@ -19,6 +19,7 @@
 
 use std::io::{ErrorKind, IsTerminal, Write};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use color_eyre::eyre::{Context, Result};
@@ -146,7 +147,7 @@ fn write_stdout(buf: &[u8]) -> Result<()> {
 
 /// Live progress indicator drawn on stderr.
 ///
-/// Each `Started` event advances a small braille spinner and rewrites the
+/// Each `Finished` event advances a small braille spinner and rewrites the
 /// status line in place via carriage-return; `Done` clears the line so that
 /// the subsequent report on stdout starts on a clean row. We track the
 /// previously-drawn line length so that we can pad with spaces on shorter
@@ -160,7 +161,14 @@ struct ProgressReporter {
     enabled: bool,
     spinner_idx: usize,
     last_len: usize,
+    last_draw: Option<Instant>,
 }
+
+/// Shortest gap between two redraws of the status line. A root with
+/// 100k small children finishes them faster than a terminal can paint,
+/// and at one redraw per child the drawing took longer than the scan.
+/// 20 redraws a second still reads as continuous motion.
+const REDRAW_INTERVAL: Duration = Duration::from_millis(50);
 
 impl ProgressReporter {
     fn new(enabled: bool) -> Self {
@@ -168,6 +176,7 @@ impl ProgressReporter {
             enabled,
             spinner_idx: 0,
             last_len: 0,
+            last_draw: None,
         }
     }
 
@@ -176,7 +185,17 @@ impl ProgressReporter {
             return;
         }
         match event {
-            Progress::Started { index, total, name } => {
+            Progress::Finished {
+                done, total, name, ..
+            } => {
+                if self
+                    .last_draw
+                    .is_some_and(|at| at.elapsed() < REDRAW_INTERVAL)
+                {
+                    return;
+                }
+                self.last_draw = Some(Instant::now());
+
                 // Braille-pattern spinner — present in essentially every
                 // unicode font shipped this decade and visually quieter
                 // than the spinning "/-\|" ASCII alternative.
@@ -188,13 +207,8 @@ impl ProgressReporter {
                 // 60 chars is conservative for an 80-column shell with a
                 // [N/M] prefix.
                 let display_name = truncate_for_display(name, 60);
-                let line = format!("{glyph} analyzing [{index}/{total}] {display_name}");
+                let line = format!("{glyph} sized [{done}/{total}] {display_name}");
                 self.draw(&line);
-            }
-            Progress::Finished { .. } => {
-                // We could redraw with "✓" here, but the next Started
-                // event will overwrite it instantly; suppressing keeps the
-                // spinner from flashing between ticks.
             }
             Progress::Done => self.clear(),
         }
@@ -322,13 +336,9 @@ fn render_pretty(
     levels: usize,
     opts: &AnalyzeOptions,
 ) -> std::io::Result<()> {
-    // Collect every row we plan to print up front. Two reasons:
-    //
-    // 1. The size column is right-aligned to the widest size string we
-    //    render, which we don't know until we've recursed.
-    // 2. Recursive analysis happens inside `collect_rows`; doing it as
-    //    a side-effect of printing would interleave stdout with the
-    //    `diskus` walker's own internal threads' output.
+    // Collect every row we plan to print up front: the size column is
+    // right-aligned to the widest size string we render, which we don't
+    // know until we've recursed.
     let mut rows: Vec<RenderRow> = Vec::new();
     collect_rows(analysis, top, levels, opts, "", 0, &mut rows);
 

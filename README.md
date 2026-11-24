@@ -1,6 +1,6 @@
 # dush
 
-Faster `du -sh *` using [diskus](https://crates.io/crates/diskus).
+Faster `du -sh *`.
 
 ## Usage
 
@@ -52,7 +52,7 @@ cargo install --path . --features gpui  # CLI + GUI
 
 - Rust **1.85+** (edition 2024) for the CLI. `dush-gpui` wants a recent
   stable toolchain. It's known to build on 1.94 and on the flake's 1.99.
-- Linux, macOS, or any Unix where `diskus` works. The CLI is pure Rust
+- Linux, macOS, or any other Unix. The CLI is pure Rust
   and has no system dependencies.
 - The GUI binary needs `libxkbcommon` and `libxcb` (plus `pkg-config`)
   to build, and a Vulkan driver plus Wayland or X11 at runtime. On
